@@ -110,3 +110,24 @@ table. Start with research + design doc, look harder for collaborators/existing 
 - Web searches (2026-10-20): "alien isolation co-op mod", "Echo Protocol alien
   isolation", "Dropper7894 github", nexusmods multiplayer, github topics
   `alien-isolation`. Reddit direct fetches blocked (403) — noted per research.md.
+
+## Phase 2 — Workspace (2026-10-20)
+
+- Test copy: robocopy of the owner's install (read-only source) →
+  `<workspace>\test-install\Alien-Isolation`, 389 dirs / 7,586 files / 30.17 GB,
+  0 failures (2026-10-20 21:43). Copy's `AI.exe` SHA-256 **matches** the owner's
+  install (DDE66521…9A90). Owner's install and saves untouched (ground rule 2).
+- Owner approved: gh sign-in, test copy, "not now" for contacting Dropper7894.
+
+### First look at the data layer (read-only, owner install)
+
+- `DATA\` layout: 301 `.PAK` archives + loose files. Key dirs: `BEHAVIOR\`,
+  `BINARY_BEHAVIOR\` (compiled behaviour trees), `ALIENCONFIGS\`, `CHR_INFO\`,
+  `GLOBAL\`, `PACKAGES\`, `TEXT\`, `UI\`.
+- Loose logic/config files are **both** `.XML` and `.BML` pairs (e.g.
+  `GBL_ITEM.XML` 236 KB / `GBL_ITEM.BML` 143 KB, `ENGINE_SETTINGS.XML`,
+  `INPUT.XML`) — consistent with OpenCAGE's AlienBML (XML source → compiled BML).
+  Confirms the game's logic layer is editable at the data level.
+- Native side still closed: `.BIN` (compiled behaviour), `.HKX64` (Havok anim),
+  `.USM` (movies). No scripting VM docs found → native RE still needed for
+  runtime sync (Phase 3+).
