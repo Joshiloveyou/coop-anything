@@ -131,3 +131,33 @@ table. Start with research + design doc, look harder for collaborators/existing 
 - Native side still closed: `.BIN` (compiled behaviour), `.HKX64` (Havok anim),
   `.USM` (movies). No scripting VM docs found → native RE still needed for
   runtime sync (Phase 3+).
+
+## Phase 3 — Understand (2026-10-20, in progress)
+
+### Static recon on the test copy (`test-install\Alien-Isolation\AI.exe`)
+
+- **PE: 32-bit x86** (machine 0x14C, "32 bit word machine"), link timestamp
+  Tue Feb 17 2015 10:36:13, 5 sections only (`.data .rdata .reloc .rsrc .text`),
+  `Dynamic base` (ASLR). No SteamStub `.bind` section. Denuvo status **unknown**
+  (check `.text` entropy before any decomp plan; deferred). Verified with
+  `dumpbin /headers`. (Recorded in case other write-ups assume 64-bit.)
+- **Imports (dumpbin /dependents):** `steam_api.dll`, KERNEL32, USER32, **WS2_32,
+  WSOCK32** (Winsock present — telemetry/LAN? to investigate), PSAPI, imagehlp,
+  SETUPAPI, **dxgi, d3d11** (D3D11 renderer), XINPUT1_3, GDI32, SHELL32, ole32,
+  WINMM, ADVAPI32, WLDAP32.
+- **Derived:** no `dinput8.dll` import → the dinput8-proxy entry point used on
+  Resident Evil/Far Cry 2 in this hub **does not apply here**. Candidate load
+  vectors instead: `dxgi.dll` proxy (loaded by any D3D11 app; also gives a Present
+  hook) or `steam_api.dll` proxy (classic, game must find real steam_api). 32-bit
+  process ⇒ x86 DLLs, 32-bit pointer space.
+- Python 3.12.10 located at `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`
+  (installed via winget; **not on this session's PATH** — use full path).
+
+### Next (Phase 3)
+
+1. Entropy check on `.text` (Denuvo?) before planning any decompile.
+2. Boot smoke test of the test copy; watch `%USERPROFILE%\Documents` for new
+   config/save dirs (per reverse-engineering.md, move them into the workspace).
+3. Study OpenCAGE/CinematicTools source for their injection method + how composites
+   are read; reuse rather than reinvent.
+4. Get Ghidra headless (pinned download, ask owner) for the runtime seam map.
