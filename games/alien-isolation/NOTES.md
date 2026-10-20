@@ -200,3 +200,15 @@ table. Start with research + design doc, look harder for collaborators/existing 
   Zip sha256 **verified against Adoptium's published checksum**: `f9d6e191…d8b4e`. ✔
 - `analyzeHeadless.bat` smoke-tested OK with `JAVA_HOME` set (2026-10-20).
 - Zips kept in `<workspace>\coop-anything-cache`.
+
+### Entropy check (2026-10-20, tool: `coop-anything-cache\pe_entropy.py`)
+
+- Per-section Shannon entropy of test-copy `AI.exe`: `.text` **6.710**, `.rdata`
+  5.147, `.data` 4.931, `.rsrc` 5.651, `.reloc` 5.783.
+- Verdict: **no packing / no SteamStub** (packed code sits near 8.0 per triage.md).
+  Plain decompilation of build 4940658 is viable. (Whether any Denuvo VM functions
+  survive inline is unknown; the code section statistics say the bulk is normal
+  compiled x86.)
+- Ghidra 12.1.4 headless import of `AI.exe` + full analysis + DecompileAll.java
+  (from cranebeaker/deus-ex-coop, read before running) launched 2026-10-20 →
+  outputs `<workspace>\decomp\AI.exe.c` + `AI.exe.functions.tsv`.
