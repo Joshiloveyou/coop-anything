@@ -161,3 +161,42 @@ table. Start with research + design doc, look harder for collaborators/existing 
 3. Study OpenCAGE/CinematicTools source for their injection method + how composites
    are read; reuse rather than reinvent.
 4. Get Ghidra headless (pinned download, ask owner) for the runtime seam map.
+
+### Boot smoke test (2026-10-20, test copy, owner approved)
+
+- Launch: `Start-Process AI.exe` — the started pid **exited immediately**; a second
+  `AI.exe` process owned the window ("Alien: Isolation" title) ~40 s later (intro
+  movies). Find: track by process name, not launcher pid.
+- Runtime: process stable, ~1.2 GB working set, responsive. Steam must be running
+  (steam.exe was up; direct launch worked without Steam launch-integration prompt).
+- Filesystem footprint of a bare boot + graceful exit (CloseMainWindow): **nothing**
+  written to Documents, `%APPDATA%`, `%LOCALAPPDATA%`, HKCU\Software (checked:
+  My Games, Feral Interactive, `Creative Assembly` key — all absent before and
+  after). Settings/saves presumably appear only after a settings change or
+  checkpoint; revisit redirection (junction/env) when we drive real gameplay.
+- Smoke test result: **boot verified on build 4940658** (QA: boot test only).
+
+### CinematicTools injection method (read 2026-10-20, repo page)
+
+- Now maintained at https://github.com/OpenCAGE/CinematicTools (fork of
+  Hattiwatti/CinematicTools). "A DLL for Alien: Isolation which hooks various
+  functionality to provide cinematic tools."
+- Build: **Win32/x86**, VS2022 v143, NuGet packages: **MinHook** (hooking),
+  DirectXTK, Boost. Output `Build\CT_AlienIsolation.dll`.
+- Load vector: **runtime injection** via https://github.com/nefarius/Injector
+  (`inject.bat` after the game is running) — *not* a proxy DLL. So the proven
+  community pattern is: external injector + hooking DLL (MinHook) into the live
+  32-bit process; hooks D3D11 among others.
+- Derived: our Stage 1 can copy this exact pattern (x86 MinHook DLL + nefarius
+  Injector or our own CreateRemoteThread loader) instead of inventing a proxy.
+
+### Toolchain installed (2026-10-20, owner approved)
+
+- Ghidra 12.1.4 PUBLIC → `<workspace>\tools\ghidra\ghidra_12.1.4_PUBLIC`.
+  Zip sha256 (pinned; release publishes no checksum):
+  `ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db`
+  (source: github.com/NationalSecurityAgency/ghidra release Ghidra_12.1.4_build).
+- Temurin JDK 21.0.12.1 → `<workspace>\tools\jdk\jdk-21.0.12.1+1`.
+  Zip sha256 **verified against Adoptium's published checksum**: `f9d6e191…d8b4e`. ✔
+- `analyzeHeadless.bat` smoke-tested OK with `JAVA_HOME` set (2026-10-20).
+- Zips kept in `<workspace>\coop-anything-cache`.
