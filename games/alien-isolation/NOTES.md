@@ -212,3 +212,41 @@ table. Start with research + design doc, look harder for collaborators/existing 
 - Ghidra 12.1.4 headless import of `AI.exe` + full analysis + DecompileAll.java
   (from cranebeaker/deus-ex-coop, read before running) launched 2026-10-20 →
   outputs `<workspace>\decomp\AI.exe.c` + `AI.exe.functions.tsv`.
+
+### Full decompile + seam hunt (2026-10-20)
+
+- **Analysis succeeded:** 456 s auto-analysis; **66,811 functions decompiled, 10
+  failed** (9 of those "Unable to read bytes at ram:0x03030303/0x020202" —
+  data-as-code false positives). Outputs: `decomp\AI.exe.c` (69.9 MB),
+  `AI.exe.functions.tsv` (67,005 lines incl. header), plus
+  `decomp\AI.exe.strings.txt` (62,670 strings ≥6 chars, via
+  `coop-anything-cache\strings_dump.py`).
+- **Engine identity: CATHODE** — RTTI class names in the exe use namespace
+  `CATHODE` (e.g. `.?AVIsMultiplayerMode@CATHODE@@`). Creative Assembly's Cathode
+  engine. *Triage correction: "Creative Assembly proprietary" in the directory
+  should say "Creative Assembly Cathode".*
+- **Script seam found:** level-logic events dispatch by string name through vtable
+  calls, e.g. `FUN_00827400` sends `"SetPlayerPos"` (with floats) to the object at
+  `this+200` under a critical section; siblings `"SetPlayerRotation"`,
+  `"Map_SetPlayerPos"`, `"SetIsCurrentArea"`, `"ClearBreadcrumbs"`, `"show_player"`,
+  `"hide_player"`, `"release_player"`, `"allow_player_to_skip"`. RTTI shows typed
+  command classes: `SetPlayerHasKeycard@CATHODE`, `GetPlayerHasGatingTool@CATHODE`
+  etc. → the Composite script layer has a **name→handler command table**; string
+  lookup helper `FUN_008572a0` = hash(name) scanned over 20-byte records.
+- **Multiplayer status: NO game netcode in this binary.** Evidence:
+  - All `connect/send/recvfrom/WSAStartup` hits trace to **libcurl**
+    (`curl_easy_send`, FTP/SMTP/TFTP strings) and **Havok visual debugger**
+    ("Server created and will poll for new client(s) on port…", hkBase) —
+    debug/HTTP only.
+  - Dormant script-layer multiplayer *concepts* exist (engine heritage):
+    RTTI `.?AVIsMultiplayerMode@CATHODE@@`, strings `IS_MULTIPLAYER_MODE`,
+    `MULTIPLAYER_MOTIVATION`, `Multiplayer_Communications`, and a diagnostic
+    "…this is okay in multiplayer, but suspicious if it triggers constantly".
+  - Derived: A:I itself never shipped MP; but **Cathode as an engine family did**
+    (Halo Wars 2, same engine, shipped multiplayer) — a possible reference binary
+    for how sessions/replication were structured in Cathode. `engine-families.md`
+    has no Cathode entry → playbook gap to propose in our PR.
+- Main loop candidates: `PeekMessageA` loops at `AI.exe.c` lines 873653 (engine
+  pump) and 1244001; `PeekMessageW`/`PostQuitMessage` at 2452334+ (likely bundled
+  third-party, e.g. crash/HTTP lib). Far Cry 2 playbook step (patch the message
+  pump imports) maps onto line 873653's loop.
