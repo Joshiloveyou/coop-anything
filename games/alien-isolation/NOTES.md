@@ -246,7 +246,69 @@ table. Start with research + design doc, look harder for collaborators/existing 
     (Halo Wars 2, same engine, shipped multiplayer) — a possible reference binary
     for how sessions/replication were structured in Cathode. `engine-families.md`
     has no Cathode entry → playbook gap to propose in our PR.
-- Main loop candidates: `PeekMessageA` loops at `AI.exe.c` lines 873653 (engine
+- Main loop candidates: `PeekMessageA` loops at `AI.exe.c` line 873653 (engine
   pump) and 1244001; `PeekMessageW`/`PostQuitMessage` at 2452334+ (likely bundled
   third-party, e.g. crash/HTTP lib). Far Cry 2 playbook step (patch the message
   pump imports) maps onto line 873653's loop.
+
+## Stage 1 — Load vector + pump probe (2026-10-20, TEST COPY ONLY)
+
+**Correction to the earlier smoke-test note:** the "second AI.exe pid" behavior was
+NOT a self-spawn — the test-copy exe calls `SteamAPI_RestartAppIfNecessary`
+(import #A of `steam_api.dll`), which hands off to the running Steam client, and
+**Steam relaunched the game from the registered real install (G:)**. So the first
+smoke test actually ran the owner's real install (bare boot, verified 0 files
+written — but still not the intent). Recorded here to keep the trail honest.
+
+### Build
+
+- `ai-coop\stage1\dxgi_proxy.cpp` + `dxgi_proxy.def` — a **dxgi.dll proxy**,
+  x86 (cl /LD /O2 via vcvarsall x86), no third-party deps. Source: workspace.
+- Forwards to real `C:\Windows\System32\dxgi.dll` (lazy LoadLibrary on first
+  export): `CreateDXGIFactory`, `CreateDXGIFactory1`, **`CreateDXGIFactory2`**,
+  `DXGIGetDebugInterface1`, `DXGIDeclareAdapterRemovalSupport`.
+  - First run died `0xC0000139` "CreateDXGIFactory2 could not be located in
+    C:\Windows\System32\d3d11.dll": the system 32-bit **d3d11.dll also imports
+    from dxgi.dll** (its only dxgi import is `CreateDXGIFactory2`, verified with
+    `dumpbin /imports C:\Windows\SysWOW64\d3d11.dll`) and it resolves against
+    OUR proxy in the app dir. Lesson for any dxgi proxy: forward everything the
+    in-process system consumers need, not just the game's own imports.
+- On `DLL_PROCESS_ATTACH`: creates `<test dir>\stage1-probe.log`, IAT-patches
+  the main module's `USER32.dll` imports (`PeekMessageA`, `PeekMessageW`,
+  `PostQuitMessage`) with logging wrappers (Far Cry 2 playbook pattern — plain
+  PE parsing + in-place thunk rewrite, no MinHook needed), snapshots loaded
+  modules. No `LoadLibrary` work in DllMain (real dxgi deferred to first export).
+
+### Steam handoff fix (required to stay in the test copy)
+
+- `$env:SteamAppId = '214490'` before `Start-Process` suppresses the
+  `SteamAPI_RestartAppIfNecessary` handoff. Verified: exactly 1 AI process,
+  path = test copy, no G: launch. (Alternative if ever needed: a steam_api.dll
+  proxy forcing that function to return FALSE.)
+
+### Run results (assertions from `stage1-probe.log`, 2026-10-20 22:59)
+
+| Check | Result |
+|---|---|
+| Probe attaches in test-copy process | ✔ attach line, correct path, pid 49788 |
+| IAT patches | ✔ 3/3 "OK" |
+| dxgi forwarding | ✔ `CreateDXGIFactory/1` calls `hr=00000000` (renderer initialized) |
+| Message pump observed live | ✔ **PeekA=27,458 ticks** over 72.7 s uptime, log ends with detach line |
+| Process count during run | ✔ exactly 1, from the test copy |
+| Real install footprint | ✔ 0 files modified in G: install during whole experiment |
+| Exit | ✔ graceful (CloseMainWindow), detach line written |
+
+- Deployed artifact: `test-install\Alien-Isolation\dxgi.dll`
+  (sha256 recorded in session log; rebuilt versions overwrite this copy of our
+  own file — nothing of the game's is ever replaced: dxgi.dll did not exist in
+  the install).
+- QA level for this stage: **manual boot test with log assertions** (not yet an
+  automated suite). No bots yet (playbook/automated-qa.md is Phase 6).
+
+### Stage 2 candidates (next)
+
+1. Hook the named-event firehose (script seam `FUN_0050e4f0` / command table) to
+   log Composite commands as they fire in gameplay.
+2. Locate and log the player position/entity each N frames (memory seam —
+   reverse-engineering.md "find a value in memory" dance in the live process).
+3. Both on top of the existing proxy; still test-copy only.
