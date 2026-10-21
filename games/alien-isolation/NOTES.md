@@ -519,8 +519,31 @@ scaffolding survived.
 ### Stage 3 status
 
 - EntityManager / Composite command layer **mapped**; dormant MP classes
-  **enumerated**; serialization protocol **identified**. Not yet: runtime
-  verification that command IDs/`+0x394` behave as read (needs a targeted probe).
+  **enumerated**; serialization protocol **identified**.
+
+### Stage 3 runtime verification (probe `ai_probe3`, 2026-10-21)
+
+Enhanced the `call_method` hook to resolve, per call: the **target object**
+(`*(a1 smartptr) + 0xC`) and the **message type** (`*(a3 smartptr) + 0x8`) and its
+object pointer (`+0xC`), then histogram the type words. Observed live in gameplay:
+
+- Message type words are **per-command-class vtable addresses**, stable and
+  repeated (e.g. `0cf735e0`, `0cf73450`, `0cf73510`, `0cfa1930`, `0cf7d2a0`, …).
+  **64 distinct message types** appear within ~1 s of play — a rich live command
+  vocabulary, matching the static `FUN_0091d9f0` command-table finding.
+- **Target objects live in a different region** (`0x18ABxxxx`, `0x1202xxxx`) from
+  the message/entity control blocks (`0x1C59xxxx`), and the *target set is small and
+  stable* during a moment of play (a handful of objects receive repeated calls).
+- **Message objects are pooled and retargeted**: only ~16 distinct message-object
+  (`msgCtrl`) addresses over thousands of calls, each carrying different type words
+  at different times. → **A sync relay must key commands by captured *type* +
+  payload at call time, never by message-object address.**
+- Method used: inject `ai_probe3.dll` (probe build whose log name derives from the
+  DLL filename, so several probe builds can co-exist in one process), read
+  `msgtype NEW:` and `cm #` lines.
+
+→ **Verdict:** the `call_method` seam yields every queued script command with a
+resolvable type and target — the interception point Phase 4 assumes is real.
 
 ## Phase 4 — Networking model chosen (2026-10-21)
 
