@@ -644,9 +644,43 @@ sync: render=(6.5801, 9.1852, 11.4342) yaw=-0.8468 err=0.000010 avg=0.000009 n=3
 ### Phase 5 status / next
 
 - **Done:** protocol, interpolation, fake-world tests (all passing), in-game
-  capture verified live.
-- **Next:** real transport between two instances — direct UDP first (easiest to
-  test, playbook §3 says keep it working), then a **mock `steam_api.dll`** so two
-  local game processes can handshake; then the Steam relay path. After that, the
-  `call_method` command relay for story/quest state.
+  capture verified live, **real UDP transport verified between two processes**.
+- **Next:** real transport between two instances — direct UDP now proven at the
+  transport level; next is wiring it into the game (two instances) with a **mock
+  `steam_api.dll`** so two local game processes can handshake; then the Steam
+  relay path. After that, the `call_method` command relay for story/quest state.
+
+### Transport (`stage5\proto\transport.h`) — VERIFIED between two processes
+
+Plain Winsock UDP (the playbook's direct-IP fallback, and the layer the Steam
+relay will slot behind). Framing: `PktHeader {kind, version, seq, fromId}` +
+`AvatarWire`. `PKT_HELLO` / `PKT_AVATAR` / `PKT_BYE`; avatar samples are sent
+**unreliable** (never retransmitted); the socket is non-blocking; the receiver
+learns its peer from the first datagram (client autoconnect).
+
+Test harness `stage5\test\transport_test.c` (modes `loopback`, `sink <port>`,
+`source <host> <port>`), built with `build_transport.bat`:
+
+| Test | Result |
+|---|---|
+| in-process loopback (200 avatars, real UDP) | ✔ 199/200 received, worst err 1.2e-5 m, in-order |
+| two-process source→sink (600 avatars, real UDP) | ✔ 600/600 received, tick 0..599 intact, yaw 2.565 (path 2.554), smooth render |
+
+### Bug found by the transport test: `AvatarWire` padding
+
+The first two-process run exposed a real defect that the fake-world test could
+**not** catch (it copies whole structs): `sizeof(AvatarWire)` is **24 bytes** on
+MSVC/x86 due to 3 bytes of padding inserted before `tick` (which needs 4-byte
+alignment after the 1-byte `qyaw`). The transport had hardcoded a 16-byte record,
+so the receiver decoded garbage `tick`/`yaw` while positions (the head of the
+struct) looked fine.
+
+Fix: `AvatarWire` is now `#pragma pack(1)` (exactly **18 bytes**: id 1 + qx/qy/qz 4
+each + qyaw 1 + tick 4) with a compile-time size assertion, and the transport uses
+`AVATAR_WIRE_SIZE` everywhere instead of a magic number. Verified: offsets are
+`id=0 qx=1 qy=5 qz=9 qyaw=13 tick=14`, and the two-process run decodes cleanly.
+
+→ Lesson for the write-up: wire formats must be explicitly packed and size-asserted,
+and a struct-copy fake-world test does not exercise the byte layout a real
+transport depends on.
 
