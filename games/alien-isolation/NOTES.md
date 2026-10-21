@@ -9,7 +9,7 @@ Owner goal: **online co-op with friends** (splitscreen out of scope unless asked
 
 - Store/version: **Steam**, appid 214490, **buildid 4940658** (from `appmanifest_214490.acf`,
   `TargetBuildID` = `buildid` = 4940658, StateFlags 4 = fully installed, 2026-10-20).
-- Install dir: `G:\SteamLibrary\steamapps\common\Alien Isolation` (owner's copy —
+- Install dir: `<SteamLibrary>\steamapps\common\Alien Isolation` (owner's copy —
   read-only for us; test copies will be made per ground rule 2).
 - Main exe: `AI.exe`, 21,822,464 bytes,
   SHA-256 `DDE66521798AAE8C39ED4E7A3400F561FCECFFF83619D1426B9E0CEDF5819A90`.
@@ -319,7 +319,7 @@ written — but still not the intent). Recorded here to keep the trail honest.
 
 - The game **re-execs itself from the registered install path**: on launch, the
   test-copy `AI.exe` calls `SteamAPI_RestartAppIfNecessary`, Steam relaunches from
-  `G:\SteamLibrary\steamapps\common\Alien Isolation`, so a `dxgi.dll` dropped in
+  `<SteamLibrary>\steamapps\common\Alien Isolation`, so a `dxgi.dll` dropped in
   the test copy is never loaded by the process that actually runs gameplay.
 - Tried a registry redirect
   (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 214490\InstallLocation`)
@@ -683,4 +683,240 @@ each + qyaw 1 + tick 4) with a compile-time size assertion, and the transport us
 → Lesson for the write-up: wire formats must be explicitly packed and size-asserted,
 and a struct-copy fake-world test does not exercise the byte layout a real
 transport depends on.
+
+### Running two local instances: the startup gate (2026-10-21)
+
+Tried launching the test copy (`<project>\test-install\Alien-Isolation`) while the
+`G:` copy was running. It **exits immediately with code 0xCACA** (51914) — Steam's
+`RestartAppIfNecessary` convention. Static analysis of the gate
+(`AI.exe.c` → `FUN_007dacd0` @ RVA 0x3DACD0 calls `FUN_00a540d0` @ RVA 0x6540D0,
+which is the Steam boot check):
+
+```c
+cVar1 = SteamAPI_RestartAppIfNecessary(DAT_0165f6b4);
+if (cVar1 != 0) { DAT_016f0ca0 = 0xcaca; return 0; }        // <-- our exit code
+DAT_01be46a8 = CreateSemaphoreA(0, 1, 1, param_2);
+if (GetLastError() == 0xb7 /*ERROR_ALREADY_EXISTS*/) {
+    MessageBoxA("Failed to start game (App already running).\n"); return 0;
+}
+cVar1 = SteamAPI_Init();
+if (cVar1 == 0) { MessageBoxA("Steam client must be running..."); return 0; }
+puVar3 = SteamApps();
+cVar1 = (**(code**)puVar3)();                                // ownership check
+if (cVar1 == 0) { MessageBoxA("...does not own the game..."); return 0; }
+```
+
+The semaphore name is the literal string **`"Alien: Isolation"`** (passed at
+`AI.exe.c` line 775070). → **A second local instance is blocked twice over:** the
+named semaphore (`ERROR_ALREADY_EXISTS`) *and* the Steam gate. Even a perfect Steam
+mock would still hit the semaphore.
+
+`AI.exe` statically imports exactly **15 symbols from `steam_api.dll`**:
+`SteamAPI_Init`, `SteamAPI_RestartAppIfNecessary`, `SteamAPI_Shutdown`,
+`SteamAPI_RegisterCallResult`, `SteamAPI_UnregisterCallResult`,
+`SteamAPI_RegisterCallback`, `SteamAPI_UnregisterCallback`, `SteamAPI_RunCallbacks`,
+and the interface accessors `SteamApps`, `SteamUser`, `SteamUtils`, `SteamFriends`,
+`SteamUserStats`, `SteamRemoteStorage`. The real DLL exports 59 (mostly accessors +
+GameServer variants we don't need).
+
+**Plan for two instances (both required):**
+1. **Mock `steam_api.dll`** in the test copy only: `RestartAppIfNecessary` → 0,
+   `Init` → 1, `IsSteamRunning` → 1, and the accessors return objects whose vtables
+   satisfy the ownership check (`SteamApps` vtable[0] → 1) and the game's optional
+   feature calls. Never installed into the owner's `G:` copy.
+2. **Patch/hook the semaphore name** for the second instance (e.g. hook
+   `CreateSemaphoreA` in the probe, or patch the string in the test copy's exe) so
+   `ERROR_ALREADY_EXISTS` never fires when deliberately running two.
+
+Verified so far: `AI.exe` / `steam_api.dll` identities and the import list; the gate
+disassembly. Not yet built: the mock.
+
+## Stage 5 — Two local instances: mock Steam API (2026-10-21)
+
+Goal of this stage: get **two local instances of the game booting side by side**
+so the co-op sync layer can be tested for real. Three blockers had to be cleared:
+the boot gate, a crash ~1 minute into the run, and the mock's Steam ABI.
+
+### Root cause #1 — the game must be launched with CWD = the game directory
+
+**Observation.** The engine's mount table (`DAT_0174ba60`, count `DAT_0174ba64`)
+and its search-path list (`DAT_0174ba54`, count `DAT_0174ba58`) are **empty**, so
+`FUN_008b0290` falls back to the **relative** path `DATA\engine_settings.xml`,
+resolved against the process's current working directory. Launch the game from
+anywhere else and the settings XML never opens.
+
+**Symptoms of getting it wrong.** `LIST_BUILT` / `REGISTER_SECTIONS` never fire,
+the settings registry is never populated, and the process later dies in the
+settings path — the old crash site was `AI+0x5A4D01`.
+
+**Consequence.** A pile of accumulated **null-check exe patches** was written to
+paper over that crash (settings flag `0x16512AC` → 0 at file offset `0x124eeac`,
+plus null-checks at RVA `0x5A4D00`, `0x60FE49`, `0x60FE68-0x60FE6F`, `0x60FE84`,
+`0x60FEB6`, `0x60FDEF`). With the CWD fixed **all of them were unnecessary and
+were reverted**. The test copy now carries **only** the gate patch (see below) —
+a much smaller and safer diff against the shipped exe.
+
+**Rule for everything from here on: always launch the game with its working
+directory set to the game directory.** `stage5/test/launch_two.ps1` does that
+(`Start-Process -WorkingDirectory`), and so does the cdb launch.
+
+### Root cause #2 — the crash was stack skew in the mock, not a null deref
+
+**Symptom.** With the mock `steam_api.dll` in place the game died after
+40–75 s with an access violation at `AI+0xD3A9A6`, exit code `0xC0000005`.
+
+**Disproved first:** a libcurl attribution. `curl_easy_init` / `curl_easy_setopt`
+breakpoints never fire, so the crash is not in the bundled HTTP client.
+
+**Actual cause.** AI.exe calls Steam interface methods **callee-pop `__thiscall`**
+— three arguments are pushed for `SteamFriends` vtable `+0x10` and there is **no
+`add esp, 0xC`** afterwards, so the *callee* pops them. The first version of the
+mock used a shared "ladder" of stubs with one fixed argument count per slot
+index. Several slots had the **wrong** count, so each such call left the
+caller's stack skewed by 4·N bytes, and a frame or two later the game
+dereferenced a garbage pointer. **That** was the crash — not a null deref, and
+not the game faulting on its own.
+
+**Fix.** One stub per `(interface, slot)` pair, each generated by a macro so the
+argument count in the signature and the argument count in the log can never
+drift apart.
+
+**Verification.** One instance under `cdb` with `sxe av` then ran **220 s with no
+access violation** (it previously died at 40–75 s), and the mock log contained
+**zero** unexpected slots.
+
+### The Steam interface ABI (extracted from the disassembly, not guessed)
+
+Every Steam interface method in AI.exe is callee-pop `__thiscall`. The rules
+that produce the right answer:
+
+* **Counting arguments:** count the `push` instructions between the **VTABLE
+  load** and the **CALL**. The vtable pointer is only ever loaded by a
+  **no-offset** load (`mov edx, dword ptr [eax]`); a load *with* an offset from
+  an interface pointer is a field access, not a vtable. Register-save pushes live
+  *before* the vtable load, and argument pushes can sit on **either side** of it
+  — so the naive "pushes after the slot load" rule undercounts.
+* **Slot detection:** `mov Y, dword ptr [vt_reg]` is slot `0x00`;
+  `mov Y, dword ptr [vt_reg+OFF]` is slot `OFF`. Offsets below `0x10` render
+  **without** the `h` suffix (`[edx+4]`, not `[edx+4h]`) — that broke an earlier
+  regex.
+* **Accessor calls come in two forms**, both must be handled:
+  `call dword ptr ds:[IAT]` and `mov reg, dword ptr ds:[IAT]` + `call reg`.
+* 100 accessor call sites were walked; all sites of a given slot agree.
+
+| Interface | slot → args |
+|---|---|
+| SteamApps | `0x00`→0, `0x10`→0, `0x18`→1, `0x1C`→1, `0x4C`→1 |
+| SteamUser | `0x04`→0, `0x08`→1, `0x18`→2 |
+| SteamUtils | `0x24`→0, `0x44`→0 |
+| SteamFriends | `0x00`→0, `0x08`→0, `0x0C`→1, `0x10`→3, `0x1C`→2, `0x20`→3, `0x58`→1, `0x5C`→3, `0x64`→2, `0x94`→2, `0x9C`→3, `0xA0`→2, `0xA4`→3 |
+| SteamUserStats | `0x00`→0, `0x08`→2, `0x10`→2, `0x18`→2, `0x1C`→1, `0x20`→1, `0x28`→0, `0x34`→3, `0x54`→1, `0x5C`→1, `0x70`→5, `0x78`→6, `0x7C`→6, `0x80`→4 |
+| SteamRemoteStorage | `0x00`→3, `0x04`→3, `0x08`→1, `0x0C`→1, `0x3C`→0, `0x40`→2, `0x44`→2, `0x54`→1, `0x60`→6 |
+
+**Return values the game actually depends on** (all verified in the disassembly):
+
+* `SteamApps +0x00` (ownership) **must be non-zero**. Both `FUN_00a540d0` and
+  `FUN_00a64c10` do `if (!c) { *(int*)0 = -1; }` — a *deliberate* null
+  dereference when the ownership check fails.
+* `SteamFriends +0x00` must return a valid **NUL-terminated string** (the game
+  `strncpy`s it into the player record).
+* `SteamUser +0x08` must **write 8 bytes** to its pointer argument — the game
+  reads both halves (`[ebp-10h]`, `[ebp-0Ch]`).
+* `SteamApps +0x10` → `"english"`.
+* `SteamUser +0x04` → 1.
+* Every stub clears **EDX**, so the slots that return a 64-bit value in
+  `EDX:EAX` (`SteamUtils +0x24` compares one against a stored triple) are
+  deterministic.
+
+### The mock `steam_api.dll`
+
+`ai-coop/stage5/mock/mock_steam_api.cpp` — 32-bit MSVC, built by
+`stage5/mock/build_mock.bat` (`vcvarsall.bat x86`; `cl /nologo /LD /O2 /EHsc`),
+linked against `mock_steam_api.def` so the exported names are pinned. It is
+**test tooling only** and is never installed into the owner's `G:` copy.
+
+* Exports the 15 symbols AI.exe imports plus a few extras.
+* `SteamAPI_Init` → 1, and builds the six interface objects;
+  `SteamAPI_RestartAppIfNecessary` → 0 (never relaunch from the real install).
+* One stub per `(interface, slot)`; each logs `slot <iface> +0xNN args=N
+  caller_rva=0x...`.
+* `StubUnknown` is the fallback for a slot that is not in the table. It is a
+  naked stub that **resolves the exact slot index at runtime** by scanning the
+  interface's vtable for its own address, and logs
+  `UNEXPECTED SLOT iface=.. slot=+0xNN caller_rva=0x..`. It deliberately pops
+  **nothing**: we do not know that call's argument count, and a wrong pop would
+  turn a clear diagnosis into a mystery crash.
+* Call log: `ai_mock_steam_<pid>.log` beside the exe — **one file per process**
+  so two instances do not interleave. Enabled with `AIC_MOCK_LOG=1`.
+
+### The exe patch that is left (and why it is narrow)
+
+The boot gate `FUN_00a540d0` does, in order: `SteamAPI_RestartAppIfNecessary`
+→ exit `0xCACA`; `CreateSemaphoreA(..., "Alien: Isolation")` →
+`ERROR_ALREADY_EXISTS` → "App already running"; `SteamAPI_Init()` → must be
+non-zero; `SteamApps()->vtable[0]()` → must be non-zero.
+
+Only the **two blocking branches** are neutralised, by turning two conditional
+jumps into unconditional ones (file offsets in `AI.exe`):
+
+```
+0x6534EB: 74 0E -> EB 0E   skip the RestartAppIfNecessary exit
+0x65351B: 75 18 -> EB 18   skip the named-semaphore "already running" exit
+```
+
+Steam initialisation **still runs**, so the interface objects the rest of the
+game dereferences are real. (Nuking the whole function instead was tried and
+crashes the process with `0xC0000005` at RVA `0x664C21`.)
+
+Test-copy `AI.exe` state: **original + the gate patch only**, SHA-256
+`570B09B2F78DE872E5A60FCA80721D17042E39D6DC3850F90D607E8F32C1F165`
+(original `DDE66521798AAE8C39ED4E7A3400F561FCECFFF83619D1426B9E0CEDF5819A90`).
+
+### Two instances side by side — VERIFIED
+
+`stage5/test/launch_two.ps1` (sets CWD, `AIC_MOCK_LOG=1`, `SteamAppId=214490`,
+starts N instances, waits, reports liveness + mock-log summary).
+
+Run of 2026-10-21, two instances, 90 s:
+
+| Check | Result |
+|---|---|
+| instances alive | ✔ 2 / 2 (≈1.12 GB working set each) |
+| crash | ✔ none (previously 40–75 s) |
+| unexpected Steam slots | ✔ 0 in each mock log |
+| call sequences | ✔ identical between the two instances |
+| single instance under `cdb` (`sxe av`) | ✔ 220 s, no access violation |
+| each instance reaches the **main menu** | ✔ verified from a screen capture |
+
+Menu verification was done without a human: the screen was captured and rendered
+as coarse ASCII, which reads the menu text directly. Scripts:
+`stage5/test/shot_instances.ps1` (launch + capture), `ascii_shot.ps1` (render),
+`diff_shot.ps1` (pixel diff), `cursor_probe.ps1`.
+
+### Tooling notes / gotchas
+
+* **Windows Defender quarantined `injector.exe`** (the Stage-2
+  `CreateRemoteThread`+`LoadLibrary` injector) from the workspace *and* from
+  `%LOCALAPPDATA%\Temp\opencode\probe-inject`. Without elevation an exclusion
+  cannot be added (`Get-MpPreference` needs administrator), so the external
+  injector is currently unusable. The probe has to be loaded another way — the
+  mock `steam_api.dll` is already in the process and can `LoadLibrary` a test
+  DLL itself, or the load vector moves to a `steam_api.dll` **proxy** that
+  forwards to the real one (the classic, and it avoids the injector entirely).
+* `cdbX86.exe` is on `PATH` (WinDbg store app). cdb launches must also set the
+  working directory to the game directory.
+* The game is 32-bit x86 with ASLR: always talk about `AI+RVA`, never an
+  absolute VA.
+* PowerShell here has no `tail`; use `Select-Object -Last N`. Inline
+  `python -c` with newlines fails — write a `.py` file and run it with
+  `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`.
+
+### Stage 5 status
+
+* ✅ One instance boots clean under cdb for 220 s with no AV.
+* ✅ **Two instances boot and run side by side, both reaching the main menu.**
+* Next: drive the UI into a level (a UI bot, not the owner), then wire the
+  `stage5/proto` UDP transport into the game process on both instances and
+  watch one player's avatar move on the other.
+
 
