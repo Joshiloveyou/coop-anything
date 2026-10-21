@@ -427,3 +427,148 @@ Result — four addresses moved with an identical, coherent displacement of
   position (`0x1CA467C0` / `0x1D5FB2A4`, verified).
 - **Stage 2 verified.** Remaining for Stage 3: interpret the EntityManager to map
   entity pointers → gameplay objects, and pick the networking model (Phase 4).
+
+## Stage 3 — EntityManager / script-command layer mapped (2026-10-21)
+
+Static work on the decompilation (`decomp\AI.exe.c`, 66,811 functions). All
+addresses below are **VAs with base 0x400000** (RVA = VA − 0x400000).
+
+### The live seam is the Composite command system, not `send_event`
+
+- `FUN_00926680` (`CATHODE:EntityManager::call_method`, RVA 0x526680) is the
+  central dispatch: `call_method(entitySmartPtr, entitySmartPtr, messageSmartPtr)`
+  (thiscall, `ret 0Ch`). It is named at runtime (`FUN_00e1bcc0("CATHODE:EntityManager::call_method")`).
+- Smart-pointer layout: arg = `{ctrlBlockPtr, ...}`; the **object** is at
+  `*arg + 0xC`. Refcount at `arg[1]`; vtable at `*object`.
+- `FUN_00926a60` (`EntityManager::process_messages`) resolves a message's **target
+  entity list** via vtable slot **`+0x118`**, then calls `call_method` per target.
+  The message object uses `+0x8` as a type word (ASCII ids `0x41/0x43/0x44/0x55`
+  = 'A'/'C'/'D'/'U' seen).
+- `FUN_0091d9f0` is the **command-type dispatcher**: the message's type
+  (`*param_1`) is compared against a table of per-command singleton globals
+  (`DAT_0174d308`, `DAT_0174d310`, … `DAT_0174d4xx`), each mapping to a handler
+  (`FUN_009366d0`, `FUN_00936c60`, `FUN_00938a20`, …). This is the Composite
+  **name→handler command table**.
+- `FUN_0050e4f0` (RVA 0x10E3B0, "send_event") builds a 3-`double` argument vector
+  and dispatches via `(*msg + 0x18)(msg[2], 0)`. **It fires 0× in normal play** —
+  script commands queue through the `call_method` path instead. Keep the send_event
+  hook dormant; `call_method` is the live seam.
+
+### The engine's logic layer is CATHODE script commands (840 classes)
+
+- **840 distinct `CATHODE::<Class>::vftable` symbols** are present in the binary
+  (full list saved to `coop-anything-cache\cathode_classes.txt`). These are the
+  complete vocabulary of the game's logic layer — every scriptable action/condition.
+- Base classes: `EntityInterface`, `EntityVariableInterface`,
+  `EntityMethodInterface` (reflection over named entity methods/variables),
+  `EntityState`, `EntityContainer`.
+- Entity classes: `Entity`, `TemporaryEntity` (runtime-spawned),
+  `ZoneableEntity` / `ZoneableEntityContainer` (streaming-zone props/NPCs),
+  `PlayerHasItemEntity`, `GenericHighlightEntity`, plus `ASSAULT_JOB_ENTITY`,
+  `RADIOSITY_ISLAND_ENTITY`, `SOUND_*_ENTITY`.
+- **Every command class is stream-serializable:** constructors are
+  `FUN_008bd950`-based (base `EntityInterface` ctor) and each class has a factory
+  thunk of the form `FUN_008bd920(stream, &ID_TOKEN, ...)`. `FUN_008bd920` calls
+  **vtable slot `+0x394`** = the "read command from stream" virtual. Each class
+  owns a 4-byte **ID token** (`DAT_0175241x`, `DAT_017523ax`, …).
+  → The script-command layer has a **generic ID + deserialize protocol**: commands
+  can be written to a stream and replayed. This is the primitive a sync layer needs.
+
+### Dormant multiplayer classes (the engine shipped MP; A:I stripped the netcode)
+
+The frame schedule `FUN_007d6a00` registers every per-frame task by name
+(`FUN_00a1a220(name, callback)`). It still contains:
+
+| Task name | Note |
+|---|---|
+| `NET_AI_UPDATE` | network AI stage — present in the frame loop |
+| `NETZ_DISPATCH` | network dispatch stage — present in the frame loop |
+| `ENTITY_MANAGER_TICK` | per-frame entity processing (`LAB_00783640`) |
+| `ENTITY_MANAGER` | `FUN_00783500` |
+| `ZONE_MANAGER` | streaming (RVA hint for zone sync) |
+
+CATHODE classes with **live vftables** for multiplayer concepts:
+
+- `ParticipatingPlayersList`, `NetPlayerCounter`, `NumConnectedPlayers`,
+  `NumPlayersOnStart`, `NumDeadPlayers`, `AllPlayersReady`
+- `FilterIsLocalPlayer`, `FilterIsAPlayer`, `DespawnPlayer`
+- `BroadcastTrigger`, `NetworkedTimer`, `TriggerSync`, `SyncOnAllPlayers`,
+  `SyncOnFirstPlayer`, `IsMultiplayerMode`, `VariableThePlayer`
+
+→ **Derived:** Cathode as an engine family shipped multiplayer (Halo Wars 2);
+A:I retains the command/player classes but no network transport. The co-op layer
+does not have to invent a state model from scratch — the *command* and *player*
+vocabulary already exists, and the command stream is serializable. A:I also ships
+`AI_UI_NET_*` strings (Steam leaderboard / sign-in UI), evidence the net-facing UI
+scaffolding survived.
+
+### Stage 3 conclusions (feed into Phase 4)
+
+1. **Interception point:** `call_method` (RVA 0x526680) sees every queued script
+   command, with entity + message smart-pointers. This is where a host writes
+   commands into a network stream and where a client applies remote commands.
+2. **Serialization:** per-command ID token + vtable `+0x394` deserialize — reuse
+   rather than reinvent the wire format.
+3. **Player identity:** `FilterIsLocalPlayer` / `ParticipatingPlayersList` give the
+   engine's own local-vs-remote concept; the confirmed position record
+   (`0x1CA467C0`, `[pos][fwd]`) is the per-frame transform to replicate.
+4. **Next (Phase 4):** pick the networking model (playbook `how-coop-mods-work.md`
+   / `networking-steam-spacewar.md`) — host-authoritative command relay +
+   transform replication looks directly supported by the above.
+
+### Stage 3 status
+
+- EntityManager / Composite command layer **mapped**; dormant MP classes
+  **enumerated**; serialization protocol **identified**. Not yet: runtime
+  verification that command IDs/`+0x394` behave as read (needs a targeted probe).
+
+## Phase 4 — Networking model chosen (2026-10-21)
+
+Per `playbook/networking.md`. A:I has **no live UDP netcode to tunnel** — the
+net-layer strings and `NET_*` frame stages exist, but there is no transport (see
+Stage 3). So section 4 (local UDP proxy) does **not** apply; this is section 1
+(sync models) work.
+
+### Chosen model (playbook defaults, adapted to the Stage 3 findings)
+
+- **Player avatars: client-authoritative, snapshot-interpolated on peers.**
+  Each player's own avatar (position + facing) is simulated locally and replicated
+  by the host to the others. The confirmed per-frame transform record
+  (`0x1CA467C0`, `[float3 pos][float3 fwd]`) is the datum; send it unreliable
+  (stale positions are worthless — playbook §1.2), quantized per §1.2.
+- **Script commands / story state: host-authoritative relay.** The whole Composite
+  command layer is serializable (per-class ID token + vtable `+0x394` deserialize,
+  Stage 3), so the host captures commands at `call_method` (RVA 0x526680), writes
+  them to a stream, and clients replay them. This is the playbook's
+  "quest and story flags — the highest-value hook" (§1.3) in this engine's own
+  vocabulary.
+- **NPC/enemy ownership:** one owner per NPC with transfer, per
+  `playbook/actor-ownership.md`. Deferred to build; the entity set is visible via
+  the `call_method` firehose and `ZoneableEntity`.
+- **Transport:** Steam relay via `ISteamNetworkingMessages` (AppID 480 Spacewar for
+  the prototype) per `networking-steam-spacewar.md`, **fallback** Tailscale/direct-IP.
+  Keep direct-IP working (easiest to test). A:I already imports `steam_api.dll`,
+  so the Steam path is native to the process.
+- **Testing:** mock steam DLL + two local instances, `clumsy` for bad-network
+  profiles (§5). Reuse `tools/` sync-testing utilities at Phase 6.
+
+### Playbook gaps found (to propose in the PR)
+
+1. **`playbook/engine-families.md` has no Cathode entry.** Cathode (Creative
+   Assembly) shipped multiplayer in Halo Wars 2; A:I retains the command/player
+   class vocabulary and a serializable command stream. A "Cathode" row would let
+   the next agent skip the rediscovery: *games:* Alien: Isolation (gap), Halo Wars 2
+   (official MP); *what carries over:* the Composite command layer (840 classes,
+   per-class ID + `+0x394` deserialize), `EntityManager::call_method` as the
+   dispatch seam, the dormant `ParticipatingPlayersList`/`FilterIsLocalPlayer`
+   classes, and the `NET_AI_UPDATE`/`NETZ_DISPATCH` frame stages.
+2. **`data/directory.yaml` engine entry for Alien: Isolation should read "Cathode"**,
+   not "Creative Assembly proprietary" (Phase 3 correction).
+
+### Phase 4 status
+
+- Model + transport **chosen and grounded in the Stage 3 findings**. Next:
+  Phase 5 build — start with the avatar replication loop (position record) and the
+  `call_method` command relay, tested without the game first (fake world), then in
+  two local instances.
+
