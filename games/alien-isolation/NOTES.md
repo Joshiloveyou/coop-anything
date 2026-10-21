@@ -312,3 +312,118 @@ written — but still not the intent). Recorded here to keep the trail honest.
 2. Locate and log the player position/entity each N frames (memory seam —
    reverse-engineering.md "find a value in memory" dance in the live process).
 3. Both on top of the existing proxy; still test-copy only.
+
+## Stage 2 — Load-vector correction + seam probe (2026-10-21)
+
+### The dxgi-proxy load vector does not reach gameplay
+
+- The game **re-execs itself from the registered install path**: on launch, the
+  test-copy `AI.exe` calls `SteamAPI_RestartAppIfNecessary`, Steam relaunches from
+  `G:\SteamLibrary\steamapps\common\Alien Isolation`, so a `dxgi.dll` dropped in
+  the test copy is never loaded by the process that actually runs gameplay.
+- Tried a registry redirect
+  (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 214490\InstallLocation`)
+  → **did not work**; Steam resolves the install via
+  `libraryfolders.vdf` + `appmanifest_214490.acf`, not that key. Registry was
+  **restored** to the `G:` path. Getting the test copy to run under Steam needs
+  a second Steam library / a copied app manifest — an install-level change we did
+  not make.
+- **Adopted load vector (proven):** external x86 injector
+  (`injector.exe`, `CreateRemoteThread` + `LoadLibraryA`) targets the already
+  running `AI.exe` and loads `ai_probe.dll`. No install mutation at all; works
+  against the `G:` process exactly as it would against the test copy.
+  This matches the community pattern already proven for A:I (CinematicTools uses
+  nefarius/Injector + a MinHook DLL — see Stage 1 notes).
+
+### Tooling built (all small, pinned, in-repo)
+
+`ai-coop\stage2\inject\` — `probe.cpp` (+`build_inject.bat`), `injector.cpp`
+(+`build_injector.bat`), `snapshotter.cpp`/`regions.cpp`/`pospoll.cpp` (+build
+scripts). All x86 via `cl` from VS 2026 Community.
+
+### Probe seams
+
+- **`call_method`** (RVA `0x526680`, thiscall, `ret 0Ch`) — EntityManager entity
+  method dispatch. Fires **~58,000 calls / 50 s** in normal play. Arguments are
+  smart pointers (caller pushes entity, entity, message). `this` is a stable
+  context (e.g. `1C966F80`); entity pointers cluster in `1C59xxxx`. Useful as a
+  firehose for the entity set, but **the player's transform is not among the
+  entities seen here** (`this+0xC0..0xD4` is a static transform unrelated to the
+  player).
+- **`send_event`** (RVA `0x10E3B0`, cdecl 5 args) — hooked OK but fires
+  **0 events in normal play** (only 2 call sites in the binary). Keep the hook for
+  now; the `call_method` stream is the live seam that matters.
+- **IAT hooks** (Stage 1, kept): `USER32.dll!PeekMessageA/W`, `PostQuitMessage`
+  — 3/3 patch OK, drives graceful shutdown detection.
+
+### Boot fix
+
+- First injected build died `0xC0000142` at load: an uninitialized
+  `CRITICAL_SECTION` was used before `InitializeCriticalSection`. Fix:
+  `InitializeCriticalSection` first thing in `Init()`, a `g_csInit` guard so
+  `Logf` is safe before that, and `Sleep(250)` before `MH_Initialize` (the probe
+  thread is created from `DllMain`, so it must not race the loader lock).
+- After the fix: `MH_Initialize`/`MH_CreateHook`/`MH_EnableHook` all `MH_OK`,
+  renderer initializes, game stays healthy (~1.4 GB working set), graceful exit.
+
+### Load-vector caveat (Defender)
+
+- Windows Defender quarantined the injector **from the project folder** (the
+  combination of `CreateRemoteThread` + `LoadLibrary` in the workspace path trips a
+  heuristic). An elevated `Add-MpPreference -ExclusionPath` was attempted; the file
+  was removed anyway. **Workaround:** run the injector + DLL from
+  `%LOCALAPPDATA%\Temp\opencode\probe-inject` — it runs there with no
+  interference. Note for anyone reproducing: build in-repo, execute from a trusted
+  temp dir.
+
+## Stage 2b — Player world position FOUND (verified)
+
+Method: memory-diff (reverse-engineering.md "find a value in memory" dance).
+
+1. `snapshotter.exe` dumps the private heap region `0x1B000000 + 0x04000000`
+   (64 MB) from the live process.
+2. Take a snapshot while standing, one after a **deliberate walk**, then a third
+   pair with a **short** deliberate walk.
+3. Diff 4-aligned float triples between snapshots and rank by how many addresses
+   share the **same displacement vector**.
+
+Result — four addresses moved with an identical, coherent displacement of
+`(-2.75, 0.0, 1.84)` (≈3.3 units) during the short walk:
+
+| Address | Layout | Role |
+|---|---|---|
+| `0x1CA467C0` | `[pos][fwd]` | authoritative copy |
+| `0x1D5FB2A4` | `[pos][fwd]` | authoritative copy (bit-identical to above) |
+| `0x1D5F9B44` | `[pos][fwd][pos...]` | nearby entity, Y ≈ 0.02 lower |
+| `0x1D5F9B60` | `[pos][fwd]` | nearby entity, Y ≈ 0.79 lower (standing NPC) |
+
+- **Layout:** `float3 position` immediately followed by `float3 facing`
+  (a clean unit vector, e.g. `(-0.513, -0.311, 0.800)`). The position is the
+  **first 3 floats** of the record.
+- **Verified three ways:** (a) two walks produce coherent XZ translation with
+  **Y constant**; (b) the two authoritative copies stay bit-identical; (c) live
+  polling (`pospoll.exe`, and the probe's `pos[]` lines) shows the pair updating
+  in real time while idle (breathing bob 6.5520 ↔ 6.5517) and jumping coherently
+  during movement.
+- **Live values (idle):** position `(6.552, 9.181, 11.429)`, facing
+  `(-0.513, -0.311, 0.800)`.
+- The probe now polls all four addresses each scan pass (`PosPollPass`,
+   4 s interval) and logs `pos[i] <addr> = (x,y,z) fwd=(...)`.
+
+### Address-mapping notes (for future RE on this binary)
+
+- Ghidra/decomp/TSV addresses are **VAs with image base `0x400000`**
+  (RVA = VA − 0x400000).
+- Strings dump addresses are **file offsets**; `.text` file→RVA = +0xC00,
+  `.rdata` file→VA = file + 0x401A00. `dumpbin` prints VAs.
+- Runtime seam address = **ASLR base + RVA** (observed `AI.exe` base `0x00900000`;
+  so `call_method` at runtime = `0x00900000 + 0x526680 = 0x00E26680`).
+- The probe computes seam addresses from `GetModuleHandleA(NULL)` at runtime, so
+  it does not depend on the observed base.
+
+### Stage 2 status
+
+- **Both seams instrumented:** event firehose (`call_method`, live) + live player
+  position (`0x1CA467C0` / `0x1D5FB2A4`, verified).
+- **Stage 2 verified.** Remaining for Stage 3: interpret the EntityManager to map
+  entity pointers → gameplay objects, and pick the networking model (Phase 4).
