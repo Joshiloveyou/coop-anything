@@ -595,3 +595,58 @@ Stage 3). So section 4 (local UDP proxy) does **not** apply; this is section 1
   `call_method` command relay, tested without the game first (fake world), then in
   two local instances.
 
+## Phase 5 — Build: avatar sync (2026-10-21, in progress)
+
+Sources live in the separate `ai-coop` project folder (not in this hub repo, per
+AGENTS.md rule 7): `ai-coop\stage5\proto\` (protocol + interpolation, header-only)
+and `ai-coop\stage5\test\` (harness + in-game capture).
+
+### Protocol (`stage5\proto\sync_proto.h`, `interp.h`)
+
+- `AvatarState { id, x, y, z, yaw, tick }`; `AvatarWire` quantizes position to
+  24-bit fixed point at 2^16 units/metre (≈0.06 mm resolution over ±167 m) and yaw
+  to 1 byte (256 steps ≈ 1.4°). Dependency-free and host-testable.
+- `InterpBuffer` implements **snapshot interpolation**: keeps a bounded history
+  keyed by arrival time, renders `renderDelayMs` behind the newest sample, lerps
+  between the bracketing snapshots, drops reordered/duplicate ticks (positions are
+  unreliable, per playbook §1.2).
+
+### Fake-world test (`stage5\test\fake_world_test.c`) — PASSED
+
+No game, no network: two simulated worlds exchange wire records over an in-memory
+link with configurable latency/jitter/loss. `fake_world_test.exe` results:
+
+| Test | Result |
+|---|---|
+| encode/decode round-trip | ✔ pos err 1.5e-5 m, yaw err 0.011 rad |
+| clean link (30 ms) tracking | ✔ worst error 0.173 m (< 0.5) |
+| lossy link (60 ms + 25 ms jitter + 20 % loss) | ✔ 779 poses, 0 NaN |
+| duplicate/out-of-order drop | ✔ older & dup ticks dropped |
+| yaw wrap over full turn | ✔ worst error 0.0123 rad |
+
+### In-game integration (`stage5\test\sync_capture.cpp`) — VERIFIED live
+
+The injected probe now round-trips the **live** player transform through the
+protocol each pass (capture → encode → decode → interpolate) and logs the
+end-to-end error. Result against real gameplay:
+
+```
+pos[1] 1d5fb2a4 = (6.5801, 9.1852, 11.4342) fwd=(-0.7340, -0.2368, 0.6365)
+sync: render=(6.5801, 9.1852, 11.4342) yaw=-0.8468 err=0.000010 avg=0.000009 n=3
+```
+
+- Error **~1e-5 m** — pure quantisation, matching the fake-world prediction.
+- Yaw `-0.8468` rad matches `atan2(fwd.x, fwd.z)` for the live facing vector,
+  and follows when the player turns.
+- The capture path reads `0x1CA467C0` (pos) + `0x1D5FB2A4+0xC` (facing, the clean
+  unit-vector copy).
+
+### Phase 5 status / next
+
+- **Done:** protocol, interpolation, fake-world tests (all passing), in-game
+  capture verified live.
+- **Next:** real transport between two instances — direct UDP first (easiest to
+  test, playbook §3 says keep it working), then a **mock `steam_api.dll`** so two
+  local game processes can handshake; then the Steam relay path. After that, the
+  `call_method` command relay for story/quest state.
+
