@@ -893,6 +893,107 @@ as coarse ASCII, which reads the menu text directly. Scripts:
 `stage5/test/shot_instances.ps1` (launch + capture), `ascii_shot.ps1` (render),
 `diff_shot.ps1` (pixel diff), `cursor_probe.ps1`.
 
+### Saves: Alien: Isolation stores them in **Steam Remote Storage**, not on disk
+
+Symptom (reported by the owner, reproducible on the test copy): after
+`PRESS ANY KEY` the game shows **"An unexpected error occurred while saving the
+game progression."** and never enters the main menu.
+
+That string is `DATA\TEXT\ENGLISH\UI.TXT` key
+`AI_UI_DLG_WSETUP_CONFIRM_SAVE_ERROR` (`UI.TXT` is UTF-16LE). There is no
+`%USERPROFILE%\Documents\My Games\Alien Isolation` directory at all (checked on
+this machine) — the game does not use the filesystem for saves. It calls
+`ISteamRemoteStorage`, i.e. **Steam Cloud**. With real Steam the files live in
+`<steam>\userdata\<accountid>\214490\remote\`.
+
+The mock's `SteamRemoteStorage` slots returned 0, so every `FileWrite` failed.
+The mock log showed exactly which calls:
+
+```
+slot SteamRemoteStorage +0x04 args=3 caller_rva=0x654C66   FileRead
+slot SteamRemoteStorage +0x3C args=0 caller_rva=0x661895   GetFileCount
+slot SteamRemoteStorage +0x40 args=2 caller_rva=0x6618CB   GetFileNameAndSize
+slot SteamRemoteStorage +0x00 args=3 caller_rva=0x663D2E   FileWrite
+```
+
+and the failure test is visible in the caller (VA = RVA + 0x400000):
+
+```
+00A63D2C  call edx                  ; vtable+0x00 = FileWrite(name, data, size)
+00A63D2E  xor  ecx,ecx
+00A63D30  test al,al
+00A63D32  sete cl                  ; 1 when the write FAILED
+00A63D36  inc  ecx
+00A63D37  mov  [esi+2F8h],ecx       ; 1 = ok, 2 = failed
+```
+
+The vtable order is the **pre-async Steamworks layout** (no
+`FileWriteAsync`/`FileReadAsync`), which is what a 2014 build uses. Derived from
+the call sites, not from an SDK header:
+
+| slot | method | args | notes |
+|---|---|---|---|
+| `0x00` | `FileWrite` | 3 | `(name, data, size) -> bool` |
+| `0x04` | `FileRead` | 3 | `(name, buf, size) -> int32`; caller does `test edx,edx / js error`, so **never return negative** |
+| `0x08` | `FileForget` | 1 | |
+| `0x0C` | `FileDelete` | 1 | |
+| `0x2C` | `FileWriteStreamOpen` | 1 | only reached while enumerating |
+| `0x3C` | `GetFileCount` | 0 | return value is a **loop bound** (`test eax,eax / jle skip`) |
+| `0x40` | `GetFileNameAndSize` | 2 | `(i, *size) -> const char*` |
+| `0x44` | `GetQuota` | 2 | `(*total, *avail)`, 64-bit outs |
+
+`GetFileCount` returning 0 is why the mock never hit slot `0x2C` and reported
+no unexpected slots — the enumeration loop at RVA `0xA618B0` was simply skipped
+(`for (i = 0; i < GetFileCount(); i++) { name = GetFileNameAndSize(i, &size); ... vtable[0x2C](name) ... }`).
+
+**Fix:** the mock now implements a small real cloud backed by
+`<game>\steam_remote\<AIC_PROFILE>\`, one directory per instance, so the two
+players in a co-op test never share save files. `FileWrite` persists and
+returns true, `FileRead` returns the bytes (0 for missing), and
+`GetFileCount`/`GetFileNameAndSize`/`GetQuota` report the directory contents so
+saved games are found again on the next run.
+
+Verified 2026-10-22, test copy, two instances, separate profiles:
+
+```
+rs FileRead 'input.cfg' -> missing
+rs GetFileCount -> 0
+rs FileWrite 'PROGRESSION.ais' 10240 bytes -> ok
+rs GetFileCount -> 1
+rs FileWrite 'MSSV01.ais' 1048576 bytes -> ok
+rs GetFileCount -> 2
+rs FileWrite 'CHSV00.ais' 2097152 bytes -> ok
+```
+
+`steam_remote\default\` then contained `PROGRESSION.ais`, `MSSV01.ais`,
+`CHSV00.ais`; a second instance with `AIC_PROFILE=p2` created its own
+`PROGRESSION.ais`. Both sat in the main menu with **no save error** (OCR of the
+screen), 0 unexpected slots.
+
+Save file names: `PROGRESSION.ais` (profile, 10 KB), `MSSV0n.ais` (mission
+save, here 1 MB) and `CHSV0n.ais` (checkpoint save, here 2 MB). The `.cfg` /
+`.mmm` suffixes seen in the disassembly belong to other files (`input.cfg` is
+read at startup; `.mmm` was not exercised).
+
+### Closing the loop on menu verification
+
+An earlier attempt at reading the menu with coarse ASCII was actually reading a
+**text editor on the other display**. Two lessons, both now baked into the
+tooling:
+
+* identify the window under test before interpreting pixels
+  (`enum_windows.ps1` prints class/title/rect/foreground per process);
+* use real OCR. `stage5/test/ocr.ps1` drives the Windows built-in engine
+  (`Windows.Media.Ocr`, no extra software, no network) over a cropped, upscaled
+  PNG and prints each line with its **image-space centre**, which is what the
+  click command consumes. It reads this game's menu text reliably.
+
+The game presents fullscreen on DISPLAY2 (`(0,0)-(3440,1440)`), so captures of
+the *virtual* screen hold the game in the **bottom half** (image row 1440 =
+screen y 0). `keys.ps1` focuses the game's `Alien: Isolation` window and sends
+real `SendInput` keystrokes (`-Key`, `-Press`, `-Hold`), because the game reads
+raw input from the foreground window and ignoring `PostMessage` is correct.
+
 ### Tooling notes / gotchas
 
 * **Windows Defender quarantined `injector.exe`** (the Stage-2
@@ -915,6 +1016,9 @@ as coarse ASCII, which reads the menu text directly. Scripts:
 
 * ✅ One instance boots clean under cdb for 220 s with no AV.
 * ✅ **Two instances boot and run side by side, both reaching the main menu.**
+* ✅ **Saves work**: the mock implements Steam Remote Storage for real, so the
+  profile and saves persist per instance (`steam_remote\<profile>\`). The
+  "unexpected error while saving the game progression" blocker is gone.
 * Next: drive the UI into a level (a UI bot, not the owner), then wire the
   `stage5/proto` UDP transport into the game process on both instances and
   watch one player's avatar move on the other.
