@@ -990,9 +990,11 @@ tooling:
 
 The game presents fullscreen on DISPLAY2 (`(0,0)-(3440,1440)`), so captures of
 the *virtual* screen hold the game in the **bottom half** (image row 1440 =
-screen y 0). `keys.ps1` focuses the game's `Alien: Isolation` window and sends
-real `SendInput` keystrokes (`-Key`, `-Press`, `-Hold`), because the game reads
-raw input from the foreground window and ignoring `PostMessage` is correct.
+screen y 0). `keys.ps1` focuses the game's `Alien: Isolation` window and sends real
+keystrokes with `keybd_event` (`-Key`, `-Press`, `-Hold`, `-MouseToX/-MouseToY`,
+`-Click`), because the game reads raw input from the foreground window and
+ignoring `PostMessage` is correct. Scan codes matter -- see the windowed section
+below.
 
 ### Tooling notes / gotchas
 
@@ -1012,10 +1014,80 @@ raw input from the foreground window and ignoring `PostMessage` is correct.
   `python -c` with newlines fails — write a `.py` file and run it with
   `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`.
 
+### Windowed mode: two instances side by side on one display
+
+Two *exclusive-fullscreen* instances on one display fight over input (only the
+foreground one receives it). Windowed mode fixes that, so the test setup runs
+both instances as ordinary windows tiled across the primary display.
+
+In-game path: **Options > Video > Screen Size**, then Left/Right to step it
+through `Fullscreen` -> `Windowed Fullscreen` -> `Windowed`. A "Video settings
+changed / would you like to apply and save?" dialog appears when you back out,
+and the change only takes effect after **Yes** (the window does not resize
+before that).
+
+`Windowed Resolution` is a second row that only appears once Screen Size is
+`Windowed`. Left/Right step it and the list **wraps** (Right from 1920x1200
+goes to 800x600). The list is ordered by ascending precedence:
+
+    800x600, 1280x720, 1280x768, 1280x800, 1280x960, 1280x1024, 1360x768,
+    1360x1024, 1366x768, 1400x1050, 1440x900, 1600x1200, 1680x1050,
+    1920x1080, 1920x1200
+
+Keep it at **1680x1050** so two windows fit a 3440x1440 display
+(2 x 1686 including the frame = 3372).
+
+The game **owns its window size** and re-asserts the configured windowed
+resolution within a frame, so a `SetWindowPos` resize is reverted. Window
+**position** is left alone, so moving works -- `tile.ps1` therefore only ever
+passes `SWP_NOSIZE`:
+
+    powershell -File tile.ps1 -Display 1     # -> (0,0) and (1720,0)
+
+Verified: two instances (separate `AIC_PROFILE`s) at (0,0) and (1720,0), each
+1686x1079 (client 1680x1050), both at the main menu, and a Down press sent to
+one window moves only that window's selection.
+
+Where the choice is stored: `DATA\engine_settings_savefile.bin`, 248 bytes --
+
+    uint32 header (0x13)
+    30 x { uint32 value; uint32 slot }    slots 0..28 and 30 (29 unused)
+    uint32 trailer (0x110d02d9)
+
+Slots seen changing: slot 6 is `Vertical Sync` (toggling it rewrites the slot)
+and slot 8 is `Windowed Resolution` (1920x1200 -> 800x600 rewrote it). The
+`value` field is *not* a plain hash of the quality name -- CRC32, FNV-1/1a,
+djb2, sdbm and Jenkins over `On`/`Off` all miss -- so do not hand-edit this
+file; drive the UI, or decode the engine's own id function first. The file is
+read at startup: a relaunch comes back at the saved 1680x1050 windowed size.
+
+Input gotchas that cost real time:
+
+* The game reads **scan codes** (raw input / DirectInput). `keybd_event` with
+  `bScan = 0` is accepted by Windows and then ignores the key -- pass
+  `MapVirtualKey(vk, 0)`, plus `KEYEVENTF_EXTENDEDKEY` for the arrow keys.
+  This is why menu navigation "worked once then stopped".
+* Do not re-assert focus before every keystroke. `AttachThreadInput` +
+  `SetForegroundWindow` around each press disturbed delivery; focus once, then
+  send with `-NoFocus`.
+* A synthetic click must **hold** the button for ~140 ms. A `mouse_event`
+  down+up inside one frame is invisible to a UI that samples once per frame:
+  the "apply and save" dialog ignored a 0 ms click and took a 140 ms one.
+  The dialog's default button is *remembered*, so `Right`+`Enter` is a coin
+  flip -- click `Yes` instead (its position comes from `ocr.ps1`).
+* Rapid `-Press N` on a value row loses presses (12 Rights advanced 10 steps).
+  Use 400-900 ms gaps and verify, or click.
+* `ocr.ps1` cannot read the dim value column reliably at small resolutions;
+  the window/client size from `enum_windows.ps1` is the trustworthy oracle for
+  display-mode changes.
+
 ### Stage 5 status
 
 * ✅ One instance boots clean under cdb for 220 s with no AV.
 * ✅ **Two instances boot and run side by side, both reaching the main menu.**
+* **Windowed mode works, tiled side by side on one display**: 1680x1050 each at
+  (0,0) and (1720,0), independent input per window (verified), and the setting
+  survives a relaunch. This is the test rig for everything below.
 * ✅ **Saves work**: the mock implements Steam Remote Storage for real, so the
   profile and saves persist per instance (`steam_remote\<profile>\`). The
   "unexpected error while saving the game progression" blocker is gone.
