@@ -1463,4 +1463,369 @@ also proved the DllMain install path is safe: its engine-hook addresses are
 unmapped in that process and MinHook simply fails them (error 7) without
 taking the process down.
 
+### The camera detector is shared code with a unit test
+
+The matrix test started life inside the probe, which meant the thing that was
+tested was not the thing that ran. It now lives in
+`stage5/coopnet/camera_detect.h` (`CamTestMatrix`) and both the probe and
+`stage5/test/cbtest.c` include that header. `cbtest.exe` builds a view
+projection from a camera at (3, 2, -4) looking at the origin and checks:
+
+```
+PASS  VP (row-vector, as written) is recognised
+      cam=(3.0000,2.0000,-4.0000) aspect=1.6000 dist=5.3852 look=1.0000
+PASS  recovered camera equals the one that built it
+PASS  recovered aspect is 1.6
+PASS  the camera looks straight at the player
+PASS  the transposed VP is recognised as column-vector
+PASS  transposed VP still recovers the camera
+PASS  view matrix is recognised in view mode
+PASS  view matrix recovers the camera
+PASS  the planted matrix is found by an offset scan       (at off=8, i.e. 0x20)
+PASS  the offset scan recovers the camera
+PASS  a plain identity is not a view-projection
+PASS  a plain identity at the origin has no camera distance
+PASS  arbitrary junk is rejected
+PASS  a NaN entry is rejected
+PASS  a camera 5.4 m away fails a 1 m distance gate
+PASS  a point off the view axis fails the look gate
+OK (0 failure(s))
+```
+
+Two things that bit during the test and are worth remembering:
+
+* `|cos|` cannot tell "in front" from "behind" - a point mirrored through the
+  camera also scores 0.93 - so the first version of the look-gate check passed
+  a point behind the camera. The gate is deliberately unsigned (the forward
+  axis's sign depends on the projection convention), and the distance gate is
+  what actually rejects that case.
+* MSVC folds `0.0 / 0.0` into a compile error (C2124); a NaN for the test has
+  to come from a `volatile` zero.
+
+The probe's geometric gate is now `dist <= 8 m` and `look >= 0.85` (~32 deg).
+The previous 0.55 was too loose: it admitted a pure translation matrix
+(`cam=(0.5,1.5,-3.5)`, basis = identity) from the menu.
+
+### Trap: the shell can steal the foreground and silently eat a whole run
+
+A menu-driving run ended up in the Controls screen with every footer OCR read
+empty. The probe log showed why:
+
+```
+== driving pid 45100 (player 1) ==
+focused hwnd=0xC20B68 pid=24624 proc=PickerHost
+WARNING: front window is not the target process
+```
+
+`PickerHost` had taken the foreground, so (a) every keystroke went to it
+instead of the game and (b) `winshot.ps1` captures the screen rect of the game
+window, which the picker was covering, so OCR had nothing to read. The script
+warned and carried on, which is exactly the wrong behaviour.
+
+Fixes now in place:
+
+* `keys.ps1 -FocusOnly` retries up to 5 times (Alt-tap to defeat the
+  foreground lock, `BringWindowToTop`, topmost flip, `SetForegroundWindow`),
+  verifies the foreground pid, and **throws** rather than sending input to the
+  wrong window.
+* `drive_level.ps1`'s `Footer()` retries OCR three times with two crops and
+  refocuses in between; `SelectItem` is direction-agnostic (jump to the top
+  with Up x8, scan down, then scan back up) instead of assuming which way the
+  wanted item lies.
+* Never run a test console while driving the menu: `CopyFromScreen` picks up
+  whatever is on top of the game window.
+
+### The camera detector was wrong in a way its own test could not see
+
+The probe spent a whole session finding no gameplay camera. The detector was
+not "too strict" - it rejected every genuine Direct3D view-projection, and it
+mis-recovered the camera from a plain view matrix too.
+
+The unit test passed because it built its matrices with the detector's own
+formula. A test that re-implements the assumption it is meant to check is not a
+test. `stage5/test/convtest.c` now builds the two standard conventions from
+first principles - `clip = v*V*P` (row-vector) and `clip = P*V*v` (column
+vector), each also stored transposed - and asks the detector about each one:
+
+```
+BEFORE                                        AFTER
+  A row-vector V*P        rejected              cam=(3.000,2.000,-4.000)
+  A transposed in memory  rejected              cam=(3.000,2.000,-4.000)
+  B column-vector P*V     rejected              cam=(3.000,2.000,-4.000)
+  B transposed in memory  rejected              cam=(3.000,2.000,-4.000)
+  view row-vector         cam=(-3.231,-1.600,-4.000)  WRONG
+  view column-vector      cam=(-3.231,-1.600,-4.000)  WRONG
+```
+
+Both bugs are the same mistake in different places: mixing up which axis the
+basis lives on. In the canonical row-vector layout (`basis in the rows,
+translation in the last row`) the camera is
+
+```
+cam = -(t.x*r + t.y*u + t.z*f)      with r,u,f the three basis ROWS
+```
+
+but the old code read `r,u,f` out of the *columns*, which mirrors the camera
+through the plane of the basis. For a plain view matrix it returned
+`-(t.z*f_row)` where `f_row = (r.z,u.z,f.z)`, i.e. the transposed basis.
+
+For the combined view-projection the same mix-up made it invent a relation that
+only holds when the camera is axis aligned, which is why the only candidates it
+ever accepted were an identity-with-translation and one shadow/reflection
+camera. The real structure is (row-vector, `M = V*P`):
+
+```
+col0 = ax * Vcol0                 ax = ay/aspect
+col1 = ay * Vcol1                 ay = 1/tan(fovY/2)
+col2 = az * Vcol2 + bz * e4       az = zf/(zf-zn), bz = -zn*zf/(zf-zn)
+col3 = Vcol2
+```
+
+so the checks are: the first three entries of `col0`, `col1`, `col3` are
+mutually orthogonal; `col2` is parallel to `col3` with ratio `r = +-az`; and
+`col2.w = r*col3.w + bz`, i.e. `bz = M[3][2] - r*M[3][3]`. The recovered camera
+is then
+
+```
+V[i] = (M[i][0]/ax, M[i][1]/ay, M[i][2]/az)      i = 0,1,2
+t    = (M[3][0]/ax, M[3][1]/ay, M[3][3])
+cam  = -(t.x*V[0] + t.y*V[1] + t.z*V[2])
+```
+
+Note `t.z = M[3][3]`, not `(M[3][2]-bz)/az` - the trailing `+bz` sits on row 3
+only, which is what made the old "closing relation" look plausible while being
+wrong for every camera that was not looking down an axis.
+
+The sign of `r` matters: a projection with its `-1` in the w row flips `col3`,
+so `bz = M[3][2] - r*M[3][3]` uses the signed ratio, not `|r|`.
+
+### The gate assumed a third-person camera
+
+Alien: Isolation is first person. The camera sits at eye height and looks
+*forward*, so the angle between its forward axis and the direction to the
+player's recorded position is around 70 degrees, not 20. The old `look >= 0.55`
+(and later `0.85`) gate therefore could not accept the one matrix that mattered.
+The gate is now distance only, and intentionally loose:
+
+* the camera must be within 5 m of the player record (it is 1-2 m),
+* the look angle is still reported, for diagnosis,
+* the aspect ratio must be 1.2-2.2.
+
+### The buffer table silently stopped at 256
+
+```
+#define MAX_CB 256
+...
+LONG n = InterlockedIncrement(&g_ncbs) - 1;
+if (n < MAX_CB) { ... } else { InterlockedDecrement(&g_ncbs); }
+```
+
+The game creates more than 256 constant buffers while loading, so every buffer
+created after that point - including per-frame gameplay ones - was dropped
+without a word. The table is now 4096 entries with a 8192-slot open-addressing
+hash (a linear scan at 60k updates/second is not affordable), and it logs if it
+ever fills up. Analysis is incremental: vertex-shader-bound buffers every pass,
+everything else round-robin with a per-pass budget, and buffers whose contents
+have not changed are skipped.
+
+Two more tools reduce the cost of the ten-minute restart loop:
+
+* `!CBCSV` writes every captured buffer to `cbdump_<pid>.bin`. `cbdump.py`
+  reads it back and searches for camera matrices offline, so a failed guess no
+  longer costs another game launch.
+* `!OVLON` starts the overlay renderer on demand. The game can be driven all
+  the way into gameplay with no overlay thread at all, then the overlay is
+  switched on once a camera matrix has actually been selected.
+* `VSSetConstantBuffers` is hooked (vtable slot 7) to mark which buffers are
+  ever bound to the vertex shader - "live per-frame data" versus hundreds of
+  loading-time buffers.
+
+## Phase 6 VERIFIED - world to screen, and a marker on the remote player (2026-10-23)
+
+The in-world avatar is now drawn in both windows at the right place, and the
+projection is checked against hand arithmetic rather than eyeballed.
+
+### The camera lives in one constant buffer, view then projection
+
+```
+buffer 576 bytes, bound to the VS, rewritten every frame
+0x040  view matrix        16 floats, column-vector form
+0x080  projection block   16 floats, column-vector form
+0x140  camera position    3 floats, verbatim (row 2 of the view translation)
+```
+
+The view matrix is column-vector: the three 3x3 *rows* are `(right, up, fwd)`,
+the translation is in the last column, `t = -R*cam`, `right x up = fwd`
+(left-handed, `z > 0` in front). The projection has no perspective term in the
+usual place: `ndc = (ax*x/z, ay*y/z)` with
+
+```
+ax = 1.437402      ay = 2.299843
+az = 1.000050      bz = -0.050002       (near 0.05, far 1000)
+ay = 1 / tan(47 deg / 2)               (47 is the record's FOV field)
+```
+
+### The detector is one header, tested two ways
+
+`stage5/coopnet/camera_detect.h` now holds `CamViewCol`, `CamProjBlock`,
+`CamProjectCol`, `CamPair` and `CamFindInBuffer`: given a buffer, find a view
+block whose recovered camera is within `maxDist` of the player record and pair
+it with a projection block that has the swap chain's aspect.
+
+* `stage5/test/convtest.c` - 36 checks, all pass: both storage conventions, real
+  captured game view matrices A and B, the real projection block, the 47 deg
+  identity, `right x up = fwd`, 1 m ahead maps to screen centre, signs,
+  behind-camera rejection, and the buffer scan's found / gated / wrong-aspect /
+  negative cases.
+* `stage5/test/camfind.c` - runs the *shipping* scan over a `!CBCSV` dump
+  (`camfind.exe FILE px py pz [aspect]`). On the real dumps it reports exactly
+  **one buffer in 4096**, `view@0x040 proj@0x080`, `as=1.6000`, camera equal to
+  the live player position; with a wrong player position it finds nothing.
+
+The buffer address changes on every launch (`074FC1E4`, `078804A4`,
+`076A7524`, ...), so a hardcoded address is not an option - the scan is required
+and it is cheap (a handful of float compares per 16-float offset).
+
+### Why the camera was never found before: two wrong gates
+
+1. **The camera sits ON the player record.** Alien: Isolation is first person,
+   so the distance from the camera to the record is ~0, not 1-2 m. Any
+   "camera must be far from the player" assumption rejects the only matrix that
+   matters. The gate is `dist <= 0.75 m`.
+2. **The look angle gate was meaningless** for the same reason (0 deg between
+   "camera forward" and "camera -> player"). Distance alone gates now.
+
+Also: the player record's `fwd` field (`blk+0x790`) is **not** the view
+direction - it is about 90 deg away from it, i.e. roughly the camera's *left*
+axis, and it lags during fast turns. Use the view matrix for anything
+directional. The avatar yaw on the wire still comes from that field, so the
+remote avatar faces 90 deg off; publishing the camera forward vector instead is
+the fix (next change).
+
+### Projection verified end to end, in the live game
+
+Both instances spawn on the same spot (same save), so the first test was
+degenerate - `depth = 0`, correctly refused. Then, with p2 at
+`(1.871, 9.195, 9.561)` and p1's camera at `(3.510, 9.193, 11.062)` looking
+along `(-0.153, 0, -0.988)`:
+
+```
+CAM remote pos=(1.871,9.194,9.562) ndc=(1.153,0.001) depth=1.73 px=(1808,524) onscreen=0
+```
+
+Hand check: `d = (-1.639, 0.001, -1.500)`, `right = up x fwd = (-0.988, 0, 0.153)`,
+`x = d.right = 1.389`, `z = d.fwd = 1.733`, `ndc.x = 1.4374*1.389/1.733 = 1.152`.
+Exact match. Turning p1 by +900 px of mouse (measured sensitivity 0.0865 deg/px)
+then gave
+
+```
+fwd=(-0.737,0,-0.676)  ndc=(0.082,-0.000)  depth=2.22  px=(909,525)  onscreen=1
+```
+
+and `1.4374 * 0.127 / 2.216 = 0.0824` by hand. Turning away by the same amount
+returns `CAM remote none` (behind the camera), which is the case that must not
+draw.
+
+Axis conventions used above: `fwd = (L[8],L[9],L[10])`,
+`right = up x fwd = (fwd.z, 0, -fwd.x)` for `up = (0,1,0)`, and screen
+`x = (ndc.x*0.5+0.5)*width`, `y = (0.5-ndc.y*0.5)*height`.
+
+### The render path is lock-free: the store publishes the two blocks
+
+The analyser picks one buffer plus the two offsets. From then on, **every fill
+of that buffer** copies the two 64-byte blocks into a double buffer
+(`CbPublishCam`, called from `CbStore`, under `g_cbLock`); the overlay copies
+whichever slot the index says and validates it with the same functions the
+analyser uses. No lock, no pointer chase, and the marker is never a whole
+analysis tick (1 s) behind the game.
+
+Two bugs came out of this design change:
+
+* **Do not clear the selection on a single validation failure.** The overlay
+  runs at ~60 Hz and the analyser at 1 Hz, so "validate, clear on failure"
+  turns into a flap loop: the overlay clears, the analyser re-selects, the
+  overlay clears... and `!CAM` almost always sees `sel=0`. Only a *run* of
+  failures (>30) drops the selection.
+* **A seqlock retry silently ate the marker.** The first version guarded the
+  copy with `g_camPubSeq` and retried 8 times, spinning with no yield. When the
+  writer was preempted mid-copy, all 8 spins saw an odd counter and the frame
+  was dropped. Symptom: the status line said `cam=1`, `drawn` had been latched
+  once, and no marker ever appeared in a screenshot. Double-buffering removed
+  the failure mode entirely (a 128-byte copy cannot be torn from the reader's
+  side).
+
+Diagnostics that made it visible, now part of `!OVL`:
+
+```
+OVL on=1 paints=3782 drawn=2690 noCam=1 why=0 lastndc=(0.33,-0.12) depth=2.77
+    lastpx=(1114,589) sel=1 buf=076A7524 view@0x040 proj@0x080 ...
+```
+
+`paints` is a paint counter (66/s at `Sleep(15)`), `why` is 0 drew / 1 no camera
+/ 2 no remote / 3 projection rejected (behind) / 4 projected off screen, and
+`lastpx` is where the last marker was put. A screenshot now has an expected
+pixel to check against.
+
+The projected point is the remote's eye minus 0.15 m (so the circle does not
+sit on the face), which is about 100 px lower on screen than the `!CAM` `px=`
+value - that offset is deliberate, not drift.
+
+### Verifying a marker when the agent cannot see the screenshot
+
+`stage5/test/pix.ps1` counts pixels of the marker colour in a PNG (and reports
+their centroid and bounding box); `pixmap.ps1` prints a coarse ASCII map of
+them. The overlay draws the marker in `RGB(0,255,128)` and its status line in
+yellow, on a black colour key, so both are unambiguous.
+
+```
+pix.ps1 -Path shot.png -X 887 -Y 607 -Radius 40
+green=355  centroid = 892,606  bbox = 863,582 .. 927,630      # cross+circle at 887,607
+pixmap.ps1 -Path shot.png                                      # ASCII map, finds scenery too
+```
+
+Scenery in this game also contains green, so a single count proves little; the
+centroid moving with the projection (`lastpx` 884 -> 1114 while p2 walked,
+`depth` 2.17 -> 2.77) is the check that matters.
+
+### Trap, second time: the overlay is a window of the game's process
+
+`Process.MainWindowHandle` returned **the overlay**, not the game: it is a
+second visible top-level window in the same pid, deliberately the same size as
+the game window, and topmost. Windows happily reports it as the main window.
+`keys.ps1` then focused it, its foreground check *passed* because it only
+compared process ids, and the game received no input at all - `USE MOVE-KEYS`
+stayed on screen, the player never moved, while `proc` and `gp` counters kept
+climbing. Mouse movement did nothing either, which is what told the two cases
+apart (a paused game still loses focus, a wrong window loses input *and* the
+camera).
+
+Fix: `stage5/test/wingame.ps1` - `[GameWin]::Find(pid)` picks the largest
+*visible* top-level window whose class is not `AICOverlay`;
+`[GameWin]::Repaint(h)` forces a paint (used to test the paint path without
+waiting for the loop); `Get-WinList` / `[GameWin]::Foreground()` print one line
+per window plus class, rect, ex-style and pid. `keys.ps1` now compares
+`GetForegroundWindow() -eq $hwnd`, not just the pid, and warns when the
+foreground is another window of the same process.
+
+The same assumption is in `tile.ps1` and `winshot.ps1`; they read
+`MainWindowHandle` too. It happened to work only because tiling runs before the
+overlay exists, and `winshot` captures the overlay's rect, which is the game's
+client area anyway.
+
+### Verification runs (2026-10-23)
+
+```
+p1 pair  view@0x040 proj@0x080 ax=1.4374 ay=2.2998 as=1.6000  (both instances)
+OVL  paints=1425 drawn=712  why=0  lastpx=(887,607)
+pix  green=355 centroid=892,606 bbox=863,582..927,630
+p2 walked 1.2 s: depth 2.17 -> 2.77, lastpx 884 -> 1114, pix centroid 1105,598
+p1 turned 180 deg: CAM remote none, OVL why=3, marker stops
+```
+
+Cost note: `MAX_CB` is 8192 with a 16384-slot hash; the log still prints
+`cb table FULL at 8192 buffers`, which is harmless because the camera buffer is
+created early and the analysis only ever needs buffers created during loading
+anyway.
+
+
 
