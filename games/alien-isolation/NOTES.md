@@ -2237,7 +2237,27 @@ until they react) and log which call_method message types fire. Correlate with
 the 65 unique message types already captured. Then look up that message type in
 the command table to find the animation handler.
 
+**Animation entry point found:**
+
+- `FUN_0052f990` (RVA 0x12f990) calls `FUN_008c63b0` (CMD_PlayAnimation variant
+  with ID token `DAT_01750850`). It first checks vtable slot `+0x398` on the
+  entity (probably a "can play animation" predicate) and a flag at
+  `*(entity+0x34)+100)+0x1c`. If both pass, it plays the animation.
+- This is the method an NPC calls to play an animation. To make the remote
+  player animate, we'd call this (or the equivalent) on the cloned entity with
+  the appropriate animation ID.
+
+**Still unknown:** the transform setter (which code writes to the entity's
+position triple). The entity scan found position data, but no writer has been
+identified. The next step is to watch an NPC's position address for writes
+using hardware breakpoints (DR0-DR3) or polling.
+
+**Research status:** Steps 1-2 partially complete. Step 3 (clone test) and
+Step 4 (door/state sync) not started. The presence co-op remains the shippable
+deliverable.
+
 ### Verification runs (2026-10-23)
+
 
 
 
