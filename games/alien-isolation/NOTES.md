@@ -1091,8 +1091,376 @@ Input gotchas that cost real time:
 * ✅ **Saves work**: the mock implements Steam Remote Storage for real, so the
   profile and saves persist per instance (`steam_remote\<profile>\`). The
   "unexpected error while saving the game progression" blocker is gone.
-* Next: drive the UI into a level (a UI bot, not the owner), then wire the
-  `stage5/proto` UDP transport into the game process on both instances and
-  watch one player's avatar move on the other.
+* ✅ **A bot drives the menus into a level** with no human input: the footer's
+  left-hand label names the selected item, so the bot OCRs it and only presses
+  keys until the wanted item is highlighted. That is what stops it landing on
+  "Survivor Mode" by accident.
+* ✅ **The player transform's layout is decoded** (see below).
+* Next: find the *live* transform in memory, then wire it to the UDP transport.
+
+### The player's transform
+
+The save system keeps the player transform in the same *named value* store the
+rest of the game's persistent variables live in. The value is called
+`"player_pos"`, is `0x30` bytes long, and is read by exactly one function -
+the save-state gatherer `FUN_00927f70` (RVA `0x527F70`..`0x529B20`).
+
+Its bytes are a **4x3 row-major world matrix**, translation in the last
+column:
+
+    f0  f1  f2  tx
+    f4  f5  f6  ty
+    f8  f9  f10 tz
+
+so the basis columns are `(f0,f4,f8)`, `(f1,f5,f9)`, `(f2,f6,f10)` and the
+position is `(f3,f7,f11)`. Verified from the byte dump of a real save: the
+three columns are unit length and mutually orthogonal to 3e-5, and the second
+column is `(0, 1, 0)` - the world's up axis.
+
+    position  = (3.4490342, 7.6275969, 11.461087)
+    forward   = ( 0.7071068, -0.0000457, -0.7071068)   (third column)
+    right     = (-0.7071068, -0.0000305, -0.7071068)   (first column)
+
+**This copy is a snapshot, not live.** It is byte-identical across two
+separate runs and does not change when the player walks (checked: the camera
+moved 67 % of the screen pixels while the value stayed fixed), so it is
+written at save time. The live transform has to be found in memory.
+
+### Finding things inside the running game
+
+The probe DLL (`stage5/coopnet`) now has a **control channel** on the same
+UDP port it uses for avatar packets: any datagram starting with `!` is a
+text command and is answered to the sender's address.
+
+| command | what it does |
+|---|---|
+| `HELLO` | pid + current live-transform address |
+| `FLOATS <addr> <n>` | dump `n` floats at `addr` |
+| `MEM <addr> <n>` | hex dump |
+| `SCANBLOB` | scan all readable memory for the saved 48-byte matrix |
+| `SCANPOS` | scan for the saved position triple on a 12-byte stride (how the matrix lays its translation column out) |
+| `SCANXFORM` | scan for any orthonormal 4x3 matrix, i.e. any world transform |
+| `WATCHHOT <ms>` | re-read every candidate for `<ms>` and report the ones whose translation or basis moved |
+| `WATCH <addr>` | use `<addr>` as the live transform from now on |
+
+`WATCHHOT` is the useful one: it turns "find the live transform" into
+"walk the player and see which matrix moves".
+
+### Input gotchas (stage 5)
+
+* The game reads raw input from the **foreground** window only. Keys sent
+  while another window has focus are dropped silently - `W` produced a 1 %
+  screen change unfocused and 67 % focused. `keys.ps1` therefore has to focus
+  the target instance before every burst of keys, and with two instances only
+  one of them can be driven at a time.
+
+### Finding the live transform: the memory-scan route is a dead end
+
+The `WATCHHOT` / `SCANXFORM` scan-and-diff approach was run to exhaustion:
+
+* A standalone out-of-process scanner (`stage5\test\memtool.ps1`,
+  `ReadProcessMemory` + `VirtualQueryEx`) snapshots all 1.53 GB of readable
+  memory in 4.4 s, so no game restart is needed to experiment.
+* Diffing "standing still" against "walking" left **139 624** floats that only
+  changed while walking, and **340 359** that changed at all.
+* Every float3-triple shape search (strides 4, 8, 12, 16, 20, 24, 32, 36, 48)
+  and every heap-range filter over the candidate set returned **only GPU /
+  D3D vertex-buffer noise** (`0x38C4xxxx`, `0x1B8Cxxxx`, `0x4FC6xxxx` -
+  values that are identical across all three components, i.e. packed vertex
+  data, not transforms).
+
+**Conclusion (observed, not guessed): the live character transform is not
+stored as a plain float3 or 3x4 matrix in a scannable heap block.** It lives
+inside an engine object reached through pointers, so no amount of raw
+scanning finds it - the object has to be *reached* through the engine's own
+accessors. This is the general lesson: for a game with a component/entity
+system, hook the accessor instead of scanning memory.
+
+### The live transform IS reachable: bbox corners of the character entity
+
+The save record's `UpdateXf` (`FUN_00597720`, RVA `0x197720`) rebuilds the
+character's world matrix from **four bbox corner properties of the character
+entity**:
+
+```
+A = FUN_008f7490(entity)   atom 0xA652ED66   (DAT_01754374)
+B = FUN_008f75a0(entity)   atom 0xF0088922   (DAT_01754364)
+C = FUN_008f7620(entity)   atom 0x5E1AEC47   (DAT_0175436c)
+D = FUN_008f75e0(entity)   atom 0xC8DE9852   (DAT_01754368)
+
+position = A + B                            (component wise)
+facing   = normalize((C + D) - (A + B))     (the matrix' third column)
+```
+
+Each of those four getters is a two-line wrapper over **one** generic
+accessor:
+
+```c
+undefined4 * FUN_008f7490(undefined4 *param_1, undefined4 param_2)
+{
+  *param_1 = DAT_0174df80; param_1[1] = DAT_0174df84; param_1[2] = DAT_0174df88;
+  FUN_008d63c0(param_2, &DAT_01754374, param_1);
+  return param_1;
+}
+```
+
+`FUN_008d63c0` (RVA `0x4D63C0`) is the engine's generic
+**entity-property getter** (`entity, &atom, out_float3`): it walks the
+entity's component list, and for the component whose property id matches the
+atom returns the stored float3. It is the single choke point for every
+float3 property read in the game.
+
+**That is the difference between the two calls:** the *save record* holds a
+snapshot of the matrix (written at level load, byte-identical afterwards),
+but `FUN_008d63c0` reads the **live** entity. Polling the four bbox atoms
+gives the live world position.
+
+Entity plumbing (needed to call it correctly):
+
+* `FUN_00597720`'s first argument is an **entity smart-pointer slot**
+  (`*(void**)slot` = the entity, `slot[1]` = refcount); it is stable because
+  the record holds a reference (`FUN_00939dc0` bumps the refcount and
+  registers the entity).
+* `FUN_00939dc0(int *param_1, undefined4 param_2, char param_3)` increments
+  `*(int*)(*param_1 + 4)` - it *acquires* a reference, it does not release.
+* The four atoms live in `.data` at `DAT_01754364..DAT_01754374`
+  (RVA `0x1354364..0x1354374`).
+
+### A dormant networked-character layer (found in `.data`)
+
+A contiguous name table at `0x012F6D58`-`0x012F7120` (pointer table at
+`0x016413B0`-`0x01641418`, one 0x01 flag byte per entry) holds the engine's
+**network message names**:
+
+```
+character_register_network_character_data      character_register_accurate_pos
+character_register_extrapolated_network_position  request_display_character
+request_logic_character                        client_entity_manager_receive_message
+character_send_message_to_logic                discontinuous_positioning
+physics_object_update_networked_object         start_ragdoll_death
+```
+
+These are *message names in a data table*, not script functions - script
+API names (e.g. `SetExitMarkerObjectivePos`) are inlined string literals in
+the code, so they show up in a Ghidra decompile while the message names
+never do. So the engine has a networked-character layer, but nothing in the
+single-player build drives it. Worth noting for the write-up: the message
+catalogue is a good map of what the engine *could* do over the wire.
+
+### Phase 5 VERIFIED: live per-frame player position over UDP (2026-10-22)
+
+The avatar loop now runs on the **real** per-frame transform, not on a save
+snapshot. The live transform is reached through the engine's own manager
+graph rather than by scanning:
+
+```
+mgr   = *(uint32_t *)0x016F0C88          ; RVA 0x12F0C88, the engine manager
+blk   = *(uint32_t *)(mgr + 0x58)        ; the player's transform block
+rec0  = blk + 0x78C                     ; 40-byte transform records
+```
+
+Each 40-byte record decodes as:
+
+| offset | meaning |
+|---|---|
+| +0x00 | float, constant `0.07875` |
+| +0x04 | float[3] forward / facing (unit) |
+| +0x10 | float[3] world position |
+| +0x1C | float, constant `47.0` |
+| +0x20 | float, constant `0.05` |
+| +0x24 | float, constant `1000.0` |
+
+So the live position of player *n* is at `blk + 0x79C + 0x40*n` and the facing at
+`blk + 0x790 + 0x40*n`. (A 4th record sits at `blk + 0x884`.) The three
+constant floats are a cheap **signature**: `rec[7] == 47`, `rec[8] == 0.05`,
+`rec[9] == 1000` confirms the block is the transform block and not something
+else that happens to look like a position.
+
+**The `forward` field is the player's yaw.** This was measured, not assumed: an
+800 px relative mouse turn moved it from `(0.997, 0, -0.077)` to
+`(-0.776, 0, 0.631)`, i.e. **145 deg of yaw**. An earlier attempt to measure
+this failed only because relative mouse injection was broken (a C# `const
+MOVE` shadowed the `Move` method in `keys.ps1`); once that was fixed the yaw
+tracks the mouse exactly.
+
+> **Warning that cost a crash:** never call the engine's generic entity
+> property getter `FUN_008d63c0` (RVA 0x4D63C0) from injected code. It bumps
+> a byte counter on the entity owner; unreleased calls overflow at 256 and the
+> engine dies with `0xC0000005` at `AI.exe+0x009d40c2`. The manager path above
+> avoids it entirely.
+
+**End-to-end test** (two instances, real UDP, no human input):
+
+| check | result |
+|---|---|
+| p1 publishes its live position | yes, every frame |
+| p2 receives it | yes, `REMOTE avatar id=1 pos=(...) yaw=... tick=...` |
+| position changes continuously while p1 walks | yes, 400+ distinct samples |
+| travel over a 3.5 s walk | ~4.8 m, smooth |
+| yaw transmitted | yes, `yaw=...` |
+
+The probe's `!LIVE` control command reports the live reader state:
+`LIVE have=1 slot=0248F46C ctx=12D07730 pos=(3.510,9.194,11.062) fwd=(0.997,0.000,-0.077)`.
+
+### Phase 6 groundwork: the engine's camera struct (2026-10-22)
+
+The engine's own world->screen projection lives in two functions,
+`FUN_00826b60` (RVA 0x426B60, "SetItemPos") and `FUN_00826f50` (RVA 0x426F50,
+"SetObjectivePos"). Both read the same camera object and both prove its
+layout:
+
+```
+cam = *(uint32_t *)(*(uint32_t *)(mgr + 0x44) + 0xbbc)
+
++0x18  float     camera x
++0x1c  float     camera y
++0x20  float     camera z
++0x24  float[3]  screen-right axis (unit)
++0x30  float[3]  screen-up axis    (unit)
++0x3c  float     vertical projection divisor
++0x40  float     horizontal projection divisor
+```
+
+and project a world point with
+
+```
+sx = 1 - (right . d) / cam[0x40]
+sy = 1 - (up    . d) / cam[0x3c]        d = world - cam
+```
+
+The first 6 dwords of the camera object (`+0x00..+0x17`) are 6 `char*` name
+slots: `FUN_0080b670` and `FUN_00835980` both walk them as an array of 6
+strings, and the camera object is selected from a small pool of named cameras.
+
+**The camera at that address is a static top-down debug camera**, not the
+gameplay camera:
+
+| field | value |
+|---|---|
+| position | (83.7667, 7.7939, -52.5946) |
+| right | (0, 0, 1) |
+| up | (-1, 0, 0) |
+| vdiv / hdiv | 88.88889 / 51.85185 |
+
+It does **not** move when the mouse turns (measured: an 800 px turn changed the
+player yaw by 145 deg and left every camera field bit-identical), and it sits
+~102 m from the live player position. A memory scan for the same signature
+within 12 m of the player over the whole heap (`0x01000000`-`0x30000000`)
+returns **0 hits**, and walking the manager's pointer graph two levels deep
+returns 0 cameras as well.
+
+**Derived (not yet proven):** the gameplay camera is not reached through
+`mgr + 0x44`. `FUN_0080b640` is the setter for that slot, and its only callers
+are `FUN_0050ce00`, `FUN_00512f80` and `FUN_005130d0` - the latter two pass
+`*(undefined4 *)(in_ECX + 0xc)`, i.e. a camera pointer held by a *camera
+object*, not by the manager. So the gameplay camera is owned by an object
+reachable through some other path, and the manager slot is a HUD/script
+camera. This is the thing Phase 6 has to find.
+
+Useful tools written for this (`stage5/test/`):
+
+* `camdump.py` - resolves `mgr -> mgr+0x44 -> +0xbbc` and dumps the camera
+  struct with unit-length / orthogonality / divisor checks.
+* `camsig.py` - heap scan for camera structs by signature, with an optional
+  `--near x,y,z --radius` filter.
+* `camscan2.py` - walks the manager graph and applies the camera signature to
+  every pointer it finds.
+* `decompq.py` - query the 73 MB Ghidra decomp:
+  `body FUN_00826f50 80`, `callers FUN_0080b640`, `grep "0xbbc"`.
+
+### Owner requirement: the two instances always stay side by side on one screen
+
+The owner asked (2026-10-22) that the two instances **always stay side by side
+on one screen**. The rig now enforces this:
+
+* the game is windowed at **1680x1050** (client), so two frames fit a
+  3440x1440 display (2 x 1686 = 3372 px);
+* `tile.ps1 -Primary` places the windows at **x = 0** and **x = 1720** on the
+  **primary** display (DISPLAY2 at 0,0), in PID order (the lower PID, i.e.
+  player 1, goes leftmost);
+* `tile.ps1` only ever moves windows (`SWP_NOSIZE`) - the game owns its size
+  and re-asserts the configured windowed resolution within a frame;
+* `tile.ps1` calls `ShowWindow(SW_RESTORE)` before positioning, because the
+  game minimises itself when it loses focus;
+* `drive_level.ps1` calls the tiler after launching **and** after the menu
+  navigation, so a fresh run always ends up tiled.
+
+**Trap worth recording:** a minimised instance that is later restored comes
+back at the **desktop resolution** (3440x1440), which looks like the game
+switched to fullscreen. It did not - `DATA\engine_settings_savefile.bin` was
+untouched since 11:11 and the windowed setting is still 1680x1050. A fresh
+launch always yields 1686x1079 windows; the fix is to restore, never to resize.
+
+### Standalone memory scanner (`stage5\test\memtool.ps1`)
+
+Out-of-process `ReadProcessMemory` + `VirtualQueryEx` tool that needs no
+game restart: `regions`, `bytes` (pattern search), `float`, `dump`, `diff`.
+Gotchas worth recording:
+
+* A 64-bit caller gets the **64-bit** `MEMORY_BASIC_INFORMATION` (48 bytes)
+  even for a 32-bit target, so `VirtualQueryEx` must be called with
+  `lpLength = 48` and the C# struct must not declare an explicit padding
+  field, or `Marshal.SizeOf` != 48.
+* `ulong + int` is invalid in C# - cast the int to `(ulong)` first.
+* 1.5 GB snapshot ≈ 4.4 s, so with a 15 s window the walk has to start
+  about 7 s in.
+
+### Phase 6: the gameplay view-projection is not in the heap — capture the pipeline
+
+The camera hunt through memory scanning ran out of road. `vpfind` (structural
+VP test: scaled-orthonormal basis, 4th basis parallel to the 3rd,
+`M[3][3] == k*(M[3][2]+1)`) is clean and validated, but over a full 2.5 GB
+snapshot it only ever returns UI/ortho matrices (`cam.y == 0`, aspect ≈ 1.6,
+look ≈ 88°) plus one 9.45 m hit at the wrong aspect. The combined
+view-projection is therefore **not stored as a contiguous 16-float block in
+process memory**; the renderer almost certainly builds it per frame and uploads
+it to a D3D11 constant buffer.
+
+So the probe now watches the D3D11 pipeline instead of the heap
+(`stage5/coopnet/coopnet.cpp`, section "D3D11 constant buffer capture"):
+
+* `DllMain` hooks `D3D11CreateDeviceAndSwapChain` and `D3D11CreateDevice` from
+  `d3d11.dll` **synchronously**, before the game's first D3D call. The loader
+  has already mapped `d3d11.dll` (AI.exe imports it), so this needs no
+  `LoadLibrary`.
+* The create hook takes the device and immediate context and hooks four
+  shared vtable slots with MinHook. Vtable indices below are from
+  `d3d11.h`, not guessed: `ID3D11Device::CreateBuffer` = 3,
+  `ID3D11DeviceContext::{Map, Unmap, UpdateSubresource}` = 14, 15, 48.
+  (In C++ mode the SDK interfaces have no `lpVtbl`, so the slot has to be
+  read out of the vtable pointer by index.)
+* Every buffer created with `D3D11_BIND_CONSTANT_BUFFER` is registered
+  (`buf`/`ByteWidth`, max 256, never released - the pointers are only ever
+  compared). Fills are mirrored into a 4 KiB snapshot from all three paths:
+  initial data, `UpdateSubresource`, and `Map`/`Unmap` (the mapped pointer
+  belongs to the driver, so the copy has to happen **before** `Unmap`).
+* A background thread runs the `vpfind` structure test over the snapshots
+  once a second, in two modes: combined VP, and pure view matrix (orthonormal
+  basis, 4th row/col `0,0,0,1`). The reconstructed camera has to sit within
+  8 m of the live player and look at it.
+* Control channel: `!CB` (summary + best), `!CBAN` (force a pass),
+  `!CBSTRICT 0|1`, `!CBDUMP <bufhex>` (first 32 floats of a snapshot).
+
+Because the create-device hooks must exist before the first device, the probe
+is launched with `AIC_PROBE_DELAY_MS=0` instead of 8000. The engine hooks are
+purely address-based patches, so they do not care how early they are installed.
+
+**Verified** with `stage5/test/d3dtest.cpp` (`d3dtest.exe <coopnet.dll>`), a
+throwaway harness that loads the probe exactly like the mock Steam DLL does and
+then creates a real D3D11 device + swapchain and fills a constant buffer 30
+times through `Map`/`Unmap` and 10 times through `UpdateSubresource`:
+
+```
+cb hook D3D11CreateDeviceAndSwapChain ok at ...
+D3D11CreateDeviceAndSwapChain hr=0x00000000 ...
+cb hook CreateBuffer ok / UpdateSubresource ok / Map ok / Unmap ok
+cbuf #0 078C21A4 bytes=256
+cb progress bufs=1 updates=40 passes=0 hits=0 ply=0
+```
+
+`updates=40` is exactly 30 + 10, so all three capture paths work. The harness
+also proved the DllMain install path is safe: its engine-hook addresses are
+unmapped in that process and MinHook simply fails them (error 7) without
+taking the process down.
 
 
