@@ -2288,8 +2288,72 @@ table to find the animation/transform handler.
 diminishing returns. The next step requires interactive testing: trigger an NPC
 animation and watch their position address for writes (using the !WATCH probe).
 
+**Heap scan limitation found:** The heap scan (scanning for float triples near the
+player) only finds static data in the exe's data section, not heap-allocated
+entities. The player's own position (11.77, 9.18, -13.55) is not found as a
+contiguous float triple, confirming that positions are stored at specific offsets
+within structures, not as raw triples. The entity scan (via call_method) only
+captures 8 entities, none of which are NPCs near the player (NPCs don't generate
+call_method calls when idle).
+
+**Revised approach for Step 1 (transform write path):**
+1. Instead of scanning for float triples, use the entity objects captured from
+   call_method. The 8 entities found have rotation matrices and positions at
+   offsets +0x78, +0x8C, +0x910, +0x924, +0xAC8, +0xADC, +0xBD0, +0xBE4.
+2. Watch one of these addresses with !WATCHPOS. If the entity is an NPC that
+   animates, the position will change and the watcher will log it.
+3. To trigger animation: walk the player near the NPC. The NPC's AI should
+   generate call_method calls (awareness, reaction), which will be captured.
+4. Correlate the position change with the logged message types.
+
+**Blocker:** The game is unstable with two instances and the input tools are
+unreliable with the overlay stealing focus. A single instance with the overlay
+OFF would be ideal for this research.
+
+**Interactive testing attempted (2026-10-23):** Walked the player near NPCs and ran
+!ENTSCAN. No new entities were captured (same 8 entities). The NPCs in this level
+do not generate call_method calls when the player approaches — they are either
+truly idle (no script commands fire) or their entity pointers are not captured
+by the call_method hook (the hook only captures a1 and a2, which are smart
+pointers; the entity object is at *ptr + 0xC, which we do dereference).
+
+**Heap scan limitation confirmed:** The heap scan (scanning for float triples near
+the player) only finds static data in the exe's data section, not heap-allocated
+entities. The player's own position is not found as a contiguous float triple.
+Positions are stored at specific offsets within structures.
+
+**Static analysis exhausted:** Searched the decomp for:
+- Transform write path (writes to entity+position offsets) — found the property
+  setter (FUN_00a31710) but not the animation transform setter.
+- CMD_PlayAnimation callers — only called via vtable dispatch, not directly.
+- Vtable references to FUN_0052f990 — not found in decomp (stored in data
+  section).
+- Command table entries — 65 message types logged but not correlated with
+  animation.
+
+**Conclusion:** The transform write path cannot be found via static analysis or
+the current probe. It requires either:
+1. Hardware breakpoints on an NPC's position address (needs the NPC address first)
+2. A different scanning approach (e.g., scanning for the NPC's vtable pointer)
+3. More extensive reverse engineering of the entity system
+
+**Revised approach for next session:**
+1. Use the property setter (FUN_00a31710, RVA 0x631710) to SET an NPC's
+   position programmatically. If we can call it with the right entity pointer
+   and property ID, we can move an NPC without finding the transform write path.
+2. Alternatively, find an NPC by scanning the heap for entity vtable pointers
+   (CATHODE::ZoneableEntity or CATHODE::Entity vftable) rather than float
+   triples.
+3. Once an NPC is found and moved, verify the game renders it and the alien
+   reacts.
+
+**Blocker:** Interactive testing is unreliable (input focus issues, game
+instability). The user needs to be at the keyboard for the interactive parts.
+
 ### Verification runs (2026-10-23)
 
+>
+>
 
 >
 
