@@ -2350,8 +2350,34 @@ the current probe. It requires either:
 **Blocker:** Interactive testing is unreliable (input focus issues, game
 instability). The user needs to be at the keyboard for the interactive parts.
 
+**NPC awareness system (LegendPlugin behavior tree):**
+
+The alien's AI is driven by a behavior tree (LegendPlugin). Perception nodes include:
+- `NPC_GetLastSensedPositionOfTarget` (command class, ID tokens DAT_01750e08/0c/10)
+- `NPC_Highest_Awareness_Monitor`
+- `NPC_Squad_GetAwarenessState` / `NPC_Squad_GetAwarenessWatermark`
+- `NPC_TargetAcquire`
+- `FilterCanSeeTarget` / `FilterIsFacingTarget`
+- `TriggerWhenSeeTarget`
+- `Internal_JOB_SearchTarget`
+- Behavior tree nodes: `ActionIdleTimeFacingTargetSensedPosition`,
+  `ActionMoveToMostRecentSensedPosition`,
+  `ConditionLastTimeSensed`,
+  `ConditionHasSearchedMostRecentSensedPosition`
+
+This means: if the remote player is a **real entity** with a valid transform in
+the host's world, the alien's existing perception system should detect them
+automatically through these nodes. No special AI code needed — just a valid
+entity with a position that the perception system can query.
+
+**Implication for in-world presence:** The critical path is entity spawning +
+transform setting. Once a real entity exists with a network-driven transform,
+the alien should perceive it through the existing behavior tree. The remaining
+work is animation (so the NPC/player looks right) and door/state sync.
+
 ### Verification runs (2026-10-23)
 
+>
 >
 >
 
