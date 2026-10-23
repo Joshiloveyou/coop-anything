@@ -1982,7 +1982,91 @@ scaling is right rather than merely plausible. The arrow also *tracks* the
 bearing: turning p1 90 deg moved the tip from the left edge to the right edge
 while the peer stayed put.
 
+### Network: host, join, and a peer that learns its own address
+
+`AIC_COOP_PEER_HOST` (default `127.0.0.1`) selects where packets go, and the
+address is resolved **once** at startup rather than on every send. Two cases:
+
+- a dotted quad, used directly;
+- anything else, resolved through `getaddrinfo` on startup, with a fallback to
+  loopback and a logged warning if it does not resolve at all.
+
+The more important change is that the host side **learns** its peer: the first
+avatar packet that arrives carries the real source address, and from then on the
+send thread talks to that address instead of the configured one. That is what
+makes this usable over the internet without both sides configuring anything —
+only the joining side needs an IP, and NAT hole-punching falls out for free
+because the host answers the mapped source port it actually saw.
+
+Learning is deliberately done field by field (`sin_addr.s_addr` via
+`InterlockedExchange`, `sin_port` via `InterlockedExchange16`) so the send thread
+can never read a half-updated address.
+
+**Bug that would have made the whole log useless:** `inet_ntoa` returns a
+pointer into a **single static buffer**. The learning log line printed both the
+new and the old address in one `Logf` call:
+
+```
+Logf("peer learned from packet: %s:%u (was %s:%u)",
+     inet_ntoa(from.sin_addr), ..., inet_ntoa(g_peer.sin_addr), ...);
+```
+
+Both `%s` therefore pointed at the same buffer and printed the same string, so
+the "was ..." part was a lie. Verified with a 10-line C program that compiles
+and runs in the stage5 test folder:
+
+```
+naive  : 127.0.0.1 (was 127.0.0.1)     <- both calls collapsed
+copied : 127.0.0.1 (was 192.168.1.7)   <- correct after copying out first
+```
+
+The fix is to `strncpy` each result into its own stack buffer before the next
+call to `inet_ntoa`.
+
+**Peer-learning test (2026-10-23):** sent a single fake avatar packet at p1
+(port 45500) from a socket bound to port 45600, using a new reusable tool,
+`stage5/test/fakepeer.ps1` (quantizes metres to the wire format, so it can stand
+in for a second player without driving a real instance through menus):
+
+```
+peer learned from packet: 127.0.0.1:45600 (was 127.0.0.1:45501)
+peer learned from packet: 127.0.0.1:45501 (was 127.0.0.1:45600)
+NET id=1 bind=45500 peer=127.0.0.1:45501 cfg=127.0.0.1 learned=1 sent=9145 recv=9143
+```
+
+The first line proves the learning path fired; the second proves it self-heals
+from p2's next packet; `learned=1` in NET proves the send path actually uses the
+learned address. The rig was still syncing (`remote=1 age=16ms stale=0`) two
+minutes later.
+
+**A control command** `!NET` reports the bind port, the peer address actually in
+use, the configured host, the learned flag, and the sent/recv counters, so a
+friend on the other end of a link can be told "run status.ps1 and paste the
+output" instead of describing symptoms.
+
+### Packaging (Phase 7 groundwork)
+
+`stage5/pack/` contains the install + run scripts, plus `aicctl.ps1` (a UDP
+control client) and `fakepeer.ps1` (a scripted peer for QA):
+
+- `install.ps1` — backs up `AI.exe` and `STEAM_API.DLL` once (never
+  overwriting a pristine backup), applies `patch_gate.py` (which refuses unless
+  the guard bytes match the expected function), installs the mock DLL and
+  `coopnet.dll`, creates `steam_remote\p1..pN`. `-Uninstall` restores.
+- `host.ps1` / `join.ps1` — one instance each, with all environment variables
+  set in one place (`aiclaunch.ps1`).
+- `local2p.ps1` — two instances on this PC, tiled side by side on the primary
+  display (the user's standing requirement).
+- `status.ps1` — asks every instance whether the link is alive and explains how
+  to read the answer.
+- `README.md` — honest about the limits: separate worlds, same save required,
+  no occlusion, no Steam overlay, no join UI.
+
+All the variables the mock and the transport read are centralised in
+`aiclaunch.ps1` so the host/join/local scripts cannot drift apart.
+
 ### Verification runs (2026-10-23)
+
 
 ```
 p1 pair  view@0x040 proj@0x080 ax=1.4374 ay=2.2998 as=1.6000  (both instances)
