@@ -2256,9 +2256,23 @@ using hardware breakpoints (DR0-DR3) or polling.
 Step 4 (door/state sync) not started. The presence co-op remains the shippable
 deliverable.
 
+**Probe built and ready (stage5/coopnet/coopnet.dll):**
+- `!ENTSCAN` captures entity pointers from call_method (dereferences smart
+  pointers to get the real entity object) and scans their memory for plausible
+  position triples. Found 64 triples across 3 entities at regular offsets.
+- `!WATCH <addr>` polls a watched address every 16ms and logs changes along
+  with the last 8 call_method message types. This correlates NPC movement
+  with the command that drives it.
+- `call_method` hook now logs message type words (65 unique 16-bit ids captured).
+
+**Next step when resuming:** Run `!ENTSCAN`, pick an NPC position address, `!WATCH`
+it, walk the player near an NPC, and read the log for position changes and
+correlated message types. Then look up the message type in the decomp's command
+table to find the animation/transform handler.
+
 ### Verification runs (2026-10-23)
 
-
+>
 
 
 
