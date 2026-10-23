@@ -1766,9 +1766,11 @@ OVL on=1 paints=3782 drawn=2690 noCam=1 why=0 lastndc=(0.33,-0.12) depth=2.77
 `lastpx` is where the last marker was put. A screenshot now has an expected
 pixel to check against.
 
-The projected point is the remote's eye minus 0.15 m (so the circle does not
-sit on the face), which is about 100 px lower on screen than the `!CAM` `px=`
-value - that offset is deliberate, not drift.
+The cross marker (before the avatar billboard) was drawn at the remote's eye
+minus 0.15 m, so it sat about 100 px lower on screen than the `!CAM` `px=`
+value - that offset was deliberate, not drift. The avatar now derives its
+position from the projected feet and crown instead, so `lastpx` is the head
+centre and `avh` is the projected body height.
 
 ### Verifying a marker when the agent cannot see the screenshot
 
@@ -1807,10 +1809,68 @@ per window plus class, rect, ex-style and pid. `keys.ps1` now compares
 `GetForegroundWindow() -eq $hwnd`, not just the pid, and warns when the
 foreground is another window of the same process.
 
-The same assumption is in `tile.ps1` and `winshot.ps1`; they read
-`MainWindowHandle` too. It happened to work only because tiling runs before the
-overlay exists, and `winshot` captures the overlay's rect, which is the game's
-client area anyway.
+The same assumption was in `tile.ps1` and `winshot.ps1`. It happened to work only
+because tiling runs before the overlay exists, and `winshot` captured the
+overlay's rect, which is the game's client area anyway. Both use
+`[GameWin]::Find` now, and `winshot` captures the **client area**
+(`GetClientRect` + `ClientToScreen`) instead of the window rect, so image
+coordinates equal the numbers `!CAM`/`!OVL` print - no more 3 px/26 px skew
+between a projection and the pixels that prove it.
+
+### The marker is now an avatar billboard, and the yaw is the camera's
+
+The wire's `yaw` used to come from the record's `fwd` field, which is ~90 deg
+off the view direction, so the remote avatar faced sideways. The send thread now
+prefers the view matrix:
+
+```c
+if (OvlGetCam(L, &ax, &ay, ccam) && CamViewCol(L, ccam, r, u, cfw))
+    st.yaw = atan2f(cfw[0], cfw[2]);      /* camera forward, +Y yaw */
+else
+    st.yaw = atan2f(g_localFwd[0], g_localFwd[2]);
+```
+
+Evidence, same spawn position on both machines: the peer's log went from
+`yaw=1.657` (the record field) to `yaw=-2.982`, and the sender's camera forward
+is `(-0.153, 0, -0.988)` whose `atan2` is `-2.988`. Before the change the two
+instances at the same spot disagreed about facing by ~90 deg.
+
+The debug cross is replaced with a screen-space humanoid built from the same
+projection (`OvlDrawAvatar`). The record is the eye, so:
+
+```
+feet      = eye - 1.62 m
+crown     = eye + 0.12 m
+height px = (crown_py - feet_py)            both ends projected separately
+shoulders = 0.45 m -> 0.2586 * h px         narrowed to 0.6 of that side-on
+parts     = ground shadow, 2 legs, torso, 2 arms (darker), head + 1 px ring
+facing    = a line on the floor from the feet along the avatar's forward axis
+```
+
+The foreshortening uses `|sin(yaw)*toCam.x + cos(yaw)*toCam.z|`, so a side-on
+avatar shows its body depth rather than its full shoulder width. Nothing here
+scales with distance by hand: every size is `h` times a real body proportion,
+so the figure keeps its shape at any range (8 px minimum, so a distant player is
+still findable).
+
+Checked against arithmetic, not eyeballed. At 2.16 m the figure is
+
+```
+avh=971 px     hand: ay * 1.74 / z * H/2 = 2.2998*1.74/2.16*525 = 972
+bbox 784..1014 = 230 px wide
+               hand: wf = 0.6+0.4*0.782 = 0.913; 0.50*w*2 = 229
+```
+
+and from the other instance at 2.02 m, `avh=1040 px` (hand: 1040) with the green
+centroid at x=1591 against `lastpx x=1594`. The legs run off the bottom of the
+screen at 2 m, which is correct: the camera is at eye height 1.6 m up.
+
+Known limitation, and the next real problem: **there is no depth test**, so the
+avatar draws through walls. A screen-space billboard can only fix that by
+sampling the depth buffer at the projected point (a copy of the depth texture,
+read on the CPU) or by ray-casting line of sight against the map; the honest
+alternative is drawing the real character mesh, which means owning a draw call
+and its shader state.
 
 ### Verification runs (2026-10-23)
 
@@ -1820,6 +1880,17 @@ OVL  paints=1425 drawn=712  why=0  lastpx=(887,607)
 pix  green=355 centroid=892,606 bbox=863,582..927,630
 p2 walked 1.2 s: depth 2.17 -> 2.77, lastpx 884 -> 1114, pix centroid 1105,598
 p1 turned 180 deg: CAM remote none, OVL why=3, marker stops
+```
+
+After the avatar change, same session shape (fresh launch, both spawn on the
+same spot, one walks away):
+
+```
+REMOTE yaw=-2.982   (camera forward atan2(-0.153,-0.988) = -2.988)
+p1: CAM ndc=(0.029,0.001) depth=2.16  OVL why=0 lastpx=(864,554) avh=971px
+    pix green centroid=865,763  bbox 784,472 .. 1014,1049   (230 px wide)
+p2: CAM ndc=(0.898,-0.009) depth=2.02  OVL why=0 lastpx=(1594,562) avh=1040px
+    pix green centroid=1591,773  bbox .. 1679,1049          (clipped at the edge)
 ```
 
 Cost note: `MAX_CB` is 8192 with a 16384-slot hash; the log still prints
