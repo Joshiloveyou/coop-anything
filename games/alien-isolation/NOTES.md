@@ -2065,7 +2065,78 @@ control client) and `fakepeer.ps1` (a scripted peer for QA):
 All the variables the mock and the transport read are centralised in
 `aiclaunch.ps1` so the host/join/local scripts cannot drift apart.
 
+### Occlusion: sampling the depth buffer at Present time
+
+The avatar is drawn in a *separate* top-level GDI window, so the game's depth
+buffer is the only honest answer to "is there a wall in front of my friend".
+Sampling has to happen on the render thread, because the immediate context is
+not thread-safe; the overlay thread only reads the result.
+
+What was added:
+
+- `IDXGISwapChain::Present` (vtable entry 8) is hooked in `Hook_CreateDevSC`,
+  via MinHook, exactly like the device/context hooks. `Hook_Present` runs on the
+  render thread and calls `OccludeSample()` before forwarding to the real Present.
+- `OccludeSample()`:
+  1. `OMGetRenderTargets` to get the bound DSV. No DSV (or not a Texture2D)
+     → hard failure, logged once.
+  2. Reads the avatar's projected pixel from `g_ovlPxX/Y` (published by the
+     overlay thread) and bails softly (result 2, not a failure) when there is no
+     on-screen figure this frame.
+  3. Creates a **1x1 staging texture** in the depth buffer's own format, once,
+     and reuses it. Copying a single texel via `CopySubresourceRegion` with a
+     1x1 `D3D11_BOX` is cheap; recreating it every frame would not be.
+  4. `Map`/read/unmap. Three formats are handled: `D32_FLOAT`,
+     `D24_UNORM_S8_UINT` (depth in the high 24 bits), `D16_UNORM`. Anything
+     else is a hard failure with the format number in the log.
+  5. Compares the sampled `z_ndc` against the avatar's own `z_ndc`
+     (`1.00005 - 0.05 / depth`): if the scene is more than 0.002 in front,
+     `g_occluded` goes to 1.
+- The overlay consults `g_occluded` (and `g_depthSamplingOk`) in the figure
+  path: an occluded avatar is replaced with the same edge arrow used for the
+  off-screen and behind-camera cases (`why=6`), with `occ=1` in `!OVL`.
+- Everything is fail-safe: three consecutive hard failures disable sampling
+  permanently for that run and log the reason; the avatar then draws through
+  walls exactly as before. `AIC_OCCLUDE=0` disables it from the start.
+
+Two new control verbs: `!OCC [0|1|auto]` forces / restores occlusion (so the
+decision logic can be tested without a wall in the right place) and `!DEPTH`
+prints the last sampled scene depth against the avatar's depth.
+
+The depth is sampled at the avatar's **head** pixel, because that is where a wall
+would first hide them, and one frame of lag between the overlay publishing the
+pixel and Present sampling it is invisible.
+
+**Result (2026-10-23): depth sampling at Present does not work for this game.**
+The pipeline itself is sound — `OMGetRenderTargets` returns a DSV, the staging
+texture is created in the buffer's own format (`D24_UNORM_S8_UINT`), the 1x1
+copy succeeds, and `Map` returns data. But 7410 consecutive samples at
+`(840,525)` all read `raw=00000000` (`scene=0.0000`), and earlier samples at
+the same camera position read `0.2477` (a 6.6 cm "wall" that is really the
+player's own weapon, or a cleared buffer). The depth buffer is **cleared before
+Present** — there is nothing to sample by the time the frame is presented.
+
+Consequences:
+
+- `AIC_OCCLUDE` defaults to **off**. Sampling is left in the code (guarded by
+  `scene < 0.001 -> not occluded`, and by the `AIC_OCCLUDE=1` switch) in case a
+  mid-frame hook point is found later, but it does not run by default and never
+  hides the avatar.
+- The avatar still draws through walls. That is the honest, current limitation,
+  and it is recorded as such in `stage5/pack/README.md`.
+- Occlusion would need either a hook placed between scene rendering and the depth
+  clear (more reverse engineering of the engine's frame graph) or a completely
+  different approach (ray-casting against the map's collision, which needs the
+  map geometry).
+
+What was learned and is worth keeping: the `Present` hook, the 1x1 staging
+texture trick, the `D24_UNORM_S8_UINT` byte layout (`(u >> 8) / 16777215`),
+the `!FAKEPX` test hook, and the `!OCC` / `!DEPTH` diagnostics. The `!FAKEPX`
+hook in particular is reusable for any future test that needs a controlled pixel
+without fighting the overlay.
+
 ### Verification runs (2026-10-23)
+
 
 
 ```
