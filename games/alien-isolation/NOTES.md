@@ -1872,6 +1872,47 @@ read on the CPU) or by ray-casting line of sight against the map; the honest
 alternative is drawing the real character mesh, which means owning a draw call
 and its shader state.
 
+### The avatar interpolates, and a silent peer disappears
+
+Packets arrive at `AIC_COOP_SEND_HZ` (20), the overlay paints at 66 Hz, so
+drawing the newest packet makes the avatar step 20 times a second. The receive
+path now stores a 4-entry ring of `{pos, yaw, ms}` under an `SRWLOCK`, and the
+paint draws **one send interval in the past**:
+
+```
+u   = (now - newest.ms) / (newest.ms - older.ms)   clamped to 1.5
+pos = older.pos + (newest.pos - older.pos) * u
+yaw = older.yaw + shortest_arc(newest.yaw - older.yaw) * u
+```
+
+`u` is 0 as a packet lands and reaches 1 one interval later, so the drawn pose
+is always between two packets that actually exist; the clamp allows a little
+extrapolation when a packet is late, then holds. The cost is 50 ms of latency,
+which is invisible at walking speed and needs no velocity estimate on the wire.
+The yaw blend wraps through `+-pi`, so turning through 180 deg does not spin the
+avatar the long way round.
+
+The same ring gives the peer a **timeout**, which the avatar needed badly: with
+no timeout it stayed on screen at its last position forever after the other
+player quit, which reads as "my friend is standing there" when they are gone.
+`REM_TIMEOUT_MS` is 1500; on expiry the draw returns 0 (`why=2`), and the log
+records the transition once (`REMOTE stale: no packet for 1516 ms`) and again
+when packets resume.
+
+Evidence:
+
+```
+during a walk:  pos=(1.370,9.227,9.562)  raw=(1.357,9.231,9.563)  age=32ms
+                (interpolated point trails the newest packet by 0.013 m, u~0.32)
+peer killed:    CAM remote none have=1 age=3250ms stale=1
+                OVL why=2 age=3485ms
+                log: REMOTE stale: no packet for 1516 ms
+                paints 2043 -> 2150 over 1.5 s while drawn stays 781
+```
+
+That last line is the check that the avatar is *gone* rather than frozen: the
+paint loop is still running (the counter climbs) but nothing is being drawn.
+
 ### Verification runs (2026-10-23)
 
 ```
