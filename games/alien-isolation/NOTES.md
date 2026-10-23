@@ -2408,6 +2408,24 @@ work is animation (so the NPC/player looks right) and door/state sync.
 The presence co-op is the shippable deliverable. In-world presence is a
 long-term research project.
 
+### Available probe commands (for in-world presence research)
+
+- `!ENTSCAN` — captures entity pointers from call_method (dereferences smart
+  pointers) and scans their memory for plausible position triples.
+- `!HEAPSCAN` — scans committed memory for float triples within 50m of the
+  player's position.
+- `!DUMPENT <addr> [nbytes]` — dumps entity memory as hex + float values.
+- `!WATCHPOS <addr>` — polls an address every 16ms and logs changes + recent
+  message types.
+- `!OCC [0|1|auto]` — force/restore occlusion (for testing).
+- `!DEPTH` — prints last sampled scene depth vs avatar depth.
+- `!FAKEPX <x> <y> [depth]` / `!FAKEPX off` — test hook for depth sampling.
+- `!NET` — peer address, learned flag, packet counters.
+- `!CAM` / `!OVL` / `!OVLON` / `!LIVE` — camera, overlay, player position.
+
+Enable entity research with `AIC_ENTRESEARCH=1` (off by default for stability).
+Enable save hooks with `AIC_SAVEHOOKS=1` (off by default, can crash on save).
+
 ### Verification runs (2026-10-23)
 
 >
