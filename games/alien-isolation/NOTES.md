@@ -2198,7 +2198,49 @@ shared-world co-op.
 This is weeks of reverse engineering. The presence co-op (what ships today) is
 the realistic deliverable; in-world presence is the next major phase.
 
+### Entity scan results (2026-10-23)
+
+The first entity scan (via !ENTSCAN) captured 256 entity pointers from
+call_method and scanned their memory for plausible position triples. Results:
+
+- 64 float triples found across 3 entities (indices 8, 43, 56).
+- The triples form repeating 3x3 rotation matrix + translation patterns
+  at regular offsets (every ~0x150-0x160 bytes), suggesting multiple
+  transform instances per entity (LODs or coordinate spaces).
+- The position values (2.75, 9.99, 9.39) do NOT match the player position
+  (3.51, 9.19, 11.06), confirming these are NPC/entity positions, not the
+  player's.
+- Entity 0 had a triple at +0x1C60: (0.50, 1.00, 42.61) - possibly a
+  different entity type.
+
+This confirms that entity memory contains position data in the same float-triple
+format as the player record. The next step is finding which code WRITES to
+these addresses during an NPC animation.
+
+**Animation command found in the decomp:**
+
+- `CATHODE::CMD_PlayAnimation` at `FUN_008c6360` (RVA 0x4c6360).
+  Constructor sets vftable; factory thunks at `FUN_008c6380/63b0/63e0` use
+  ID tokens `DAT_0175084c/50/54` (three variants, probably different parameter
+  sets).
+- `CATHODE::CHR_PlaySecondaryAnimation` at RVA 0x4c6410+ (separate class).
+- `CATHODE::PlayEnvironmentAnimation` and `CATHODE::CAGEAnimation` also exist.
+
+The message type words logged from call_method (0x0450, 0x0510, ..., 0xff10)
+are 16-bit identifiers from the Composite command system. To find which one
+corresponds to CMD_PlayAnimation, the next step is to trigger an NPC animation
+and log which message type fires — or to scan the command table (`DAT_0174d308..`)
+for the entry whose ID token matches `DAT_0175084c`.
+
+**Next research step (Step 2):** trigger an NPC animation (approach an NPC
+until they react) and log which call_method message types fire. Correlate with
+the 65 unique message types already captured. Then look up that message type in
+the command table to find the animation handler.
+
 ### Verification runs (2026-10-23)
+
+
+
 
 
 
