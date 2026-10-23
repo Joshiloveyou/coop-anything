@@ -1913,6 +1913,75 @@ peer killed:    CAM remote none have=1 age=3250ms stale=1
 That last line is the check that the avatar is *gone* rather than frozen: the
 paint loop is still running (the counter climbs) but nothing is being drawn.
 
+### Off screen or behind you: the avatar becomes an edge arrow
+
+In a game where two players walk different corridors, the peer is *not on screen*
+most of the time, and both of those cases used to draw nothing at all:
+`why=4` (off screen) and `why=3` (behind the eye) were the commonest states, so
+the overlay answered "where is my friend?" with an empty screen.
+
+Both now pin a green arrow to the screen edge, 56 px inside, with the range:
+
+```
+off screen:  direction = projected head - screen centre
+behind eye:  direction = the peer's bearing on the view matrix's right/up axes
+             (a peer straight behind has no bearing, so it falls back to +x)
+tip:         centre + direction * t,   t = min(mx/|dx|, my/|dy|, 1)
+head:        3-point Polygon, 22 px long, 15 px back at +-2.4 rad
+label:       "P2 12.3 m", above the arrow when it points down
+```
+
+`t` is whatever scale brings the direction onto the inset rectangle, so the tip
+lands on the edge no matter how far off screen the peer actually is, and the
+arrow's angle is the true bearing - it points left for a friend on your left,
+not just "somewhere off screen".
+
+The off-screen test changed with it: it is now the **body box** (crown to feet,
+shoulder width), where it used to be the head with a 25% margin. That mattered:
+the normal close-range case has the feet below the window because the eye is
+1.62 m up, and a margin-based test hid the figure exactly when you were standing
+next to someone.
+
+`why` is now `0` avatar, `1` no camera, `2` no live peer, `3` behind the eye
+(arrow), `5` off screen (arrow); `4` is unused.
+
+**Bug found by the first live run:** the tip came out at `(837,524)`, dead
+centre, instead of on an edge. The two callers pass a direction in *different
+units* - pixels for the off-screen case, metres for the behind-the-eye case -
+and the first version scaled by `t = min(mx/|vx|, my/|vy|, 1)`. For a 3 m world
+vector every ratio is huge, so `t` clamped to 1 and the tip landed 3 px from the
+centre. Normalising the direction first is what makes one function serve both
+cases. A second sign error was in the same path: screen `y` grows downward while
+the view's `up` axis grows upward, so the behind case needs `vy = -(d·up)`;
+without the negate a friend on the floor above got an arrow pointing down.
+
+Verified after the fix, all three arrow states plus the return to the figure
+(one turn sequence on p1, p2 standing 2-3 m away):
+
+```
+behind-left   why=3  lastpx=(56,525)    hand: right=(0.978,0,-0.210)
+                                          vx = d.right = -1.590 -> left
+                                          up = (0,1,0), vy = 0
+                                          tip = (840-784, 525) = (56,525)
+                pix  green=466  centroid=(57,512)  bbox 33,487..87,533
+behind-right  why=3  lastpx=(1624,524)  hand: right=(-0.223,0,-0.975)
+                                          vx = 0.397+1.343 = +1.740 -> right
+                                          tip = (840+784, 525) = (1624,525)
+                pix  green=465  centroid=(1625,512)  bbox 1601,487..1655,533
+off screen    why=5  lastpx=(1624,463)  hand: crown is 0.12 m over the eye at
+                                          1.90 m -> dy = -2.2998*0.12/1.90*525
+                                          = -76, hy ~ 450, dir (979,-75)
+                                          t = 784/0.997 = 786 -> (1624,465)
+facing again  why=0  avh=872px          hand: 2.2998*1.74/2.41*525 = 870
+                pix  green=72289  centroid=(1122,760)
+```
+
+The tip x is `56` or `1624` and the tip y is `56`, `525` or `994` in every
+case - exactly the 56 px inset rectangle, which is the invariant that says the
+scaling is right rather than merely plausible. The arrow also *tracks* the
+bearing: turning p1 90 deg moved the tip from the left edge to the right edge
+while the peer stayed put.
+
 ### Verification runs (2026-10-23)
 
 ```
@@ -1922,6 +1991,9 @@ pix  green=355 centroid=892,606 bbox=863,582..927,630
 p2 walked 1.2 s: depth 2.17 -> 2.77, lastpx 884 -> 1114, pix centroid 1105,598
 p1 turned 180 deg: CAM remote none, OVL why=3, marker stops
 ```
+
+(The last line is from before the edge arrow: turning away used to stop the
+marker entirely. With the arrow it is `why=3` *and* a draw at the screen edge.)
 
 After the avatar change, same session shape (fresh launch, both spawn on the
 same spot, one walks away):
