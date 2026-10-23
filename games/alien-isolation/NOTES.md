@@ -2270,7 +2270,26 @@ it, walk the player near an NPC, and read the log for position changes and
 correlated message types. Then look up the message type in the decomp's command
 table to find the animation/transform handler.
 
+**Property setter found:**
+
+- `FUN_00a31710` (RVA 0x631710) is a property setter that takes a string
+  value and sets it on an entity. It uses a switch statement with cases
+  0x160-0x168 (and more) mapping to offsets 0x780-0x7ec. Case 0x167 sets
+  +0x79c (position X), 0x168 sets +0x7c4 (position Y/Z). It calls
+  `FUN_006c3cb0` to get a string, then `_atof` to convert.
+- This is the script-driven property setter, not the transform write path for
+  NPC animation. The transform setter (which moves entities during animation)
+  is a different function.
+- `FUN_0052f990` (RVA 0x12f990) is the animation entry point: it calls
+  `FUN_008c63b0` (CMD_PlayAnimation) after checking vtable slot +0x398 and a
+  flag. It is never called directly (vtable dispatch).
+
+**The transform write path remains unknown.** Static analysis has reached
+diminishing returns. The next step requires interactive testing: trigger an NPC
+animation and watch their position address for writes (using the !WATCH probe).
+
 ### Verification runs (2026-10-23)
+
 
 >
 
