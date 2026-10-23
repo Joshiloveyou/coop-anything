@@ -2375,8 +2375,42 @@ transform setting. Once a real entity exists with a network-driven transform,
 the alien should perceive it through the existing behavior tree. The remaining
 work is animation (so the NPC/player looks right) and door/state sync.
 
+**Heap scan and entity scan limitations confirmed:**
+- Heap scan finds static data in the exe's data section, not heap-allocated entities.
+- Entity scan (via call_method) only captures 8-13 entities, none of which are NPCs
+  near the player. NPCs don't generate call_method calls when idle.
+- Entities are streamed in/out dynamically (they become invalid when the player
+  moves to a different area).
+- DUMPENT on captured entities shows they are doors, lights, triggers, and other
+  static objects — not NPCs.
+
+**Property setter found (FUN_00a31710, RVA 0x631710):**
+- Script-driven property setter with cases 0x160-0x168 mapping to offsets
+  0x780-0x7ec. Case 0x167 sets +0x79c (position X), 0x168 sets +0x7c4.
+- Takes a string parameter (FUN_006c3cb0 → _atof). Not a direct API.
+
+**Animation entry point found:**
+- `FUN_0052f990` (RVA 0x12f990) calls `FUN_008c63b0` (CMD_PlayAnimation)
+  after checking vtable slot +0x398 and a flag. Invoked via vtable dispatch.
+
+**NPC awareness system:**
+- LegendPlugin behavior tree. If a real entity with a valid transform exists,
+  the alien should perceive it automatically.
+
+**Revised approach:**
+1. Scan the heap for entity vtable pointers (CATHODE::Entity / ZoneableEntity)
+   instead of float triples. Requires finding the runtime vtable address.
+2. Use the property setter to set an NPC's position programmatically.
+3. Or: find the transform setter by watching an NPC's position with a hardware
+   breakpoint (needs the NPC address first).
+
+**Blocker:** Interactive testing is unreliable (input focus, game instability).
+The presence co-op is the shippable deliverable. In-world presence is a
+long-term research project.
+
 ### Verification runs (2026-10-23)
 
+>
 >
 >
 >
