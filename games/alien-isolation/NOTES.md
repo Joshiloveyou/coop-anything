@@ -2135,7 +2135,71 @@ the `!FAKEPX` test hook, and the `!OCC` / `!DEPTH` diagnostics. The `!FAKEPX`
 hook in particular is reusable for any future test that needs a controlled pixel
 without fighting the overlay.
 
+### Stage 4 — in-world presence research (started 2026-10-23)
+
+The goal: make the remote player a real entity in the host's world (collision,
+alien AI awareness, doors). This is the gap between presence co-op and
+shared-world co-op.
+
+**What the engine exposes (from the decomp, base 0x400000):**
+
+- `FUN_00943330` (`CATHODE::TemporaryEntity` constructor, RVA 0x543330) builds
+  a runtime-spawned entity from a stream (`param_1`). It sets the vtable to
+  `CATHODE::TemporaryEntity::vftable` and initialises fields at offsets
+  0, 0x14, 0x20, 0x24, 0x28, 0x30, 0x34, 0x38, 0x3c. It reads from the
+  stream via `FUN_008c31c0` (refcount/ownership), `FUN_0091e250` (a double,
+  probably a timestamp), and `FUN_00578af0` (reads a pointer from the stream).
+- `FUN_00922df0` (`0x522df0`) is the only caller — a factory that allocates
+  0x40 bytes, bumps a refcount, and invokes the TemporaryEntity constructor
+  with a stream. **Everything is stream-driven:** there is no "spawn at (x,y,z)"
+  entry point that takes coordinates directly.
+- `FUN_008bd920` is the base `EntityInterface` factory thunk used by all 840
+  command classes; it calls vtable slot `+0x394` to "read command from stream".
+  Each class owns a 4-byte ID token (`DAT_0175241x`, etc.).
+- `TemporaryEntity` is the runtime-spawned class (vs `ZoneableEntity` for
+  streaming-zone props/NPCs and `Entity` for authored ones).
+
+**Implications:**
+
+1. Spawning is not a simple "create entity at position" call. The engine expects
+   a serialised stream. Either we build a valid stream by hand (hard, but the
+   format is partially understood from the constructor) or we **clone an
+   existing NPC**: find a ZoneableEntity in the level, copy its memory, repoint
+   its transform, and drive it from the network. Cloning is the pragmatic route.
+2. The transform setter is unknown. The player transform lives at
+   `blk+0x79C/0x7C4/0x7EC` ( floats). NPCs presumably have the same layout
+   (the EntityScanPass in stage2 found float triples inside entities). Setting it
+   means finding the write path, not just the read path.
+3. Animation: `EntityMethodInterface` reflects named methods/variables, and the
+   engine has 840 command classes. The animation controller is almost certainly
+   one of them (a method like "PlayAnimation" or "SetPose"). Finding it means
+   scanning the command-type table (`DAT_0174d308..`) for an animation handler.
+4. AI awareness: the alien's perception is driven by the same `call_method`
+   dispatch (RVA 0x526680). An NPC that is a `ZoneableEntity` with a valid
+   transform and animation may be perceived by the alien automatically, or may
+   need its "sight/sound" entity variables set.
+
+**Next research steps (in order):**
+
+1. **Find the transform write path.** Use the stage2 EntityScanPass approach on a
+   known NPC: walk up to an NPC, scan for its float triple, then watch which
+   code writes to that address during a scripted animation (e.g. the NPC
+   turning). That gives the transform setter RVA.
+2. **Find the animation command.** Log `call_method` message type words during an
+   NPC animation and correlate with the command table. The handler that fires
+   during a walk cycle is the animation driver.
+3. **Clone test.** Once (1) and (2) are known, attempt to duplicate an NPC's
+   memory block, repoint its transform to a network-driven value, and confirm
+   the game renders it and the alien reacts.
+4. **Door/state sync.** Doors are entities too (ZoneableEntity). Syncing their
+   open/closed state means finding the door's state variable and replicating
+   writes.
+
+This is weeks of reverse engineering. The presence co-op (what ships today) is
+the realistic deliverable; in-world presence is the next major phase.
+
 ### Verification runs (2026-10-23)
+
 
 
 
