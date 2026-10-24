@@ -2455,6 +2455,36 @@ NPCs not generating call_method calls). The presence co-op is the shippable
 deliverable. In-world presence is a long-term research project requiring
 significant reverse engineering.
 
+**Further findings (2026-10-24):**
+
+- `FUN_008b9bd0` (RVA 0x4b9bd0) is the command-table lookup: takes a message
+  type word, returns a pointer to a data structure (DAT_0174d318, etc.). There
+  are 100+ entries mapping message types to handlers. Correlating a specific
+  message type with CMD_PlayAnimation requires either triggering an animation
+  and logging which type fires, or scanning all handlers for calls to
+  FUN_0052f990 (not found — it's vtable-dispatched).
+- The entity scan (ENTSAN) captures 8-13 entities, all static objects (doors,
+  lights, triggers). NPCs do not generate call_method calls.
+- The heap scan finds static data, not heap entities.
+- The DUMPENT on captured entities shows they are doors/lights (rotation
+  matrices + positions), not NPCs.
+
+**Conclusion:** The current probe approach cannot find NPC entity pointers.
+NPCs are likely ZoneableEntities loaded via streaming, and their positions are
+not in the same memory regions as the captured entities. Finding them requires
+either scanning for entity vtable pointers or using the game's own entity
+enumeration (which we haven't found yet).
+
+**Revised approach (for next session):**
+1. Find the runtime vtable address for CATHODE::ZoneableEntity or
+   CATHODE::Entity by searching the binary for RTTI type name strings.
+2. Scan heap memory for pointers to that vtable.
+3. Once an NPC entity is found, watch its position and trigger animations.
+4. Use the property setter (FUN_00a31710) to set positions programmatically.
+
+**Blocker:** Interactive testing is unreliable. The presence co-op is the
+shippable deliverable. In-world presence is a long-term research project.
+
 ### Verification runs (2026-10-24)
 
 >
