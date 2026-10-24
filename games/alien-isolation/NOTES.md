@@ -2426,7 +2426,36 @@ long-term research project.
 Enable entity research with `AIC_ENTRESEARCH=1` (off by default for stability).
 Enable save hooks with `AIC_SAVEHOOKS=1` (off by default, can crash on save).
 
-### Verification runs (2026-10-23)
+**Interactive testing results (2026-10-24):**
+- Ran ENTSAN multiple times. Captured 8-13 entity pointers per scan, but the
+  entities are doors, lights, triggers, and other static objects — not NPCs.
+- Entity addresses become stale quickly (streaming zones unload them).
+- !DUMPENT on captured entities shows they are freed/reused (garbage data).
+- NPCs do not generate call_method calls when idle, so they are never captured.
+- Heap scan finds static data in the exe's data section, not heap entities.
+- The player's own position is not found as a contiguous float triple in memory.
+
+**Conclusion:** The current probe approach (capturing entities from call_method)
+cannot find NPC positions. A different approach is needed:
+1. Scan for entity vtable pointers (CATHODE::Entity / ZoneableEntity) in heap
+   memory. Requires finding the runtime vtable address (search the binary for
+   RTTI strings like "ZoneableEntity").
+2. Use hardware breakpoints (DR0-DR3) on a known position address to find the
+   transform writer. But we need the NPC address first.
+3. Use the property setter (FUN_00a31710) to set an NPC's position. But we
+   need the NPC's entity pointer first.
+
+**Revised approach:** Find the runtime vtable address for CATHODE::Entity or
+CATHODE::ZoneableEntity by searching the game's memory for the RTTI type name
+string, then scan the heap for pointers to that vtable. This is more targeted
+than scanning for float triples.
+
+**Blocker:** Interactive testing is unreliable (input focus, game instability,
+NPCs not generating call_method calls). The presence co-op is the shippable
+deliverable. In-world presence is a long-term research project requiring
+significant reverse engineering.
+
+### Verification runs (2026-10-24)
 
 >
 >
